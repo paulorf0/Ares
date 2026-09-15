@@ -34,7 +34,7 @@ func main() {
 		}
 
 		if err := pB.AddICECandidate(i.ToJSON()); err != nil {
-			slog.Error("[ADD CANDIDATE PB]: %w", err)
+			slog.Error("add candidate to PB", "error", err)
 			return
 		}
 	})
@@ -45,7 +45,7 @@ func main() {
 		}
 
 		if err := pA.AddICECandidate(i.ToJSON()); err != nil {
-			slog.Error("[ADD CANDIDATE PA]: %w", err)
+			slog.Error("add candidate to PA", "error", err)
 			return
 		}
 	})

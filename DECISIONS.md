@@ -117,6 +117,26 @@ command-line flag or an environment variable.
 failure to diagnose. `pion/turn/v5` is already in `go.mod` should a local TURN
 be needed for testing.
 
+### D10 - Liveness: absolute deadline, not ping/pong
+
+Every peer gets a single read deadline when it connects, never refreshed. When
+it expires the read fails, the room slot is released and the room is dropped if
+empty. Default: 5 minutes.
+
+**Rationale:** a peer whose network dies sends no close frame, and TCP takes
+around two hours to notice. The slot would stay occupied, and since a room holds
+exactly two peers, the user would reconnect with the same code and be told the
+room is full by their own ghost.
+
+Ping/pong was considered and not chosen: it exists to keep connections of
+indeterminate length alive, while by D6 signaling only has to survive the
+handshake. An absolute deadline buys the same slot release with no extra
+protocol.
+
+**Accepted cost:** detection is slow. If a peer dies mid-handshake, the other one
+waits for the deadline instead of being told right away. Revisit if that wait
+becomes annoying in practice.
+
 ---
 
 ## Open decisions
