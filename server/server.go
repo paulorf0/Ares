@@ -304,15 +304,13 @@ func writePump(p *Peer) {
 	}
 }
 
-func Server() {
-	hub := NewHub()
+// Server runs the signaling server on addr until it fails. It brings its own
+// mux so that several instances can coexist in one process.
+func Server(addr string) error {
+	mux := http.NewServeMux()
+	mux.HandleFunc("/ws", Handler(NewHub()))
 
-	http.HandleFunc("/ws", handleWS(hub))
-
-	addr := ":8080"
 	log.Println("[Server] listening on", addr)
-	err := http.ListenAndServe(addr, nil)
-	if err != nil {
-		log.Fatal("[Listen And Serve]: ", err)
-	}
+
+	return http.ListenAndServe(addr, mux)
 }

@@ -1,4 +1,4 @@
-package server
+package client
 
 import (
 	"encoding/json"
@@ -41,7 +41,7 @@ type Client struct {
 	pendingICE []webrtc.ICECandidateInit
 }
 
-func NewClient(signalURL, roomID string) (*Client, error) {
+func New(signalURL, roomID string) (*Client, error) {
 	c := &Client{
 		roomID: roomID,
 		closed: make(chan struct{}),

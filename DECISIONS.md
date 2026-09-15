@@ -137,6 +137,27 @@ protocol.
 waits for the deadline instead of being told right away. Revisit if that wait
 becomes annoying in practice.
 
+### D11 - Repo layout: library packages plus thin commands
+
+```
+client/       WebRTC peer: signaling handshake, data channel
+server/       signaling hub: rooms, roles, blind relay
+messages/     wire format shared by both
+cmd/ares/     client binary
+cmd/signal/   server binary
+tests/        every test, external to the packages it exercises
+```
+
+**Rationale:** the client used to live in `server/`, which made the signaling
+package depend on the whole pion stack for code that was not its own. Separate
+packages keep each import list honest.
+
+The commands hold no logic: they parse flags and call the library. That is what
+keeps the signaling address out of the code (D8) and makes both sides testable
+without binding a fixed port.
+
+**Closes A3.**
+
 ---
 
 ## Open decisions
@@ -145,7 +166,6 @@ becomes annoying in practice.
 |---|----------|----------------|
 | A1 | Interface: TUI (bubbletea) or plain CLI | Before phase 1 becomes usable |
 | A2 | License (MIT vs AGPL) | Before the first public push |
-| A3 | Repo layout (`cmd/ares/` + `cmd/signal/`) | While building the server |
 | A4 | Local message history (SQLite / file / none) | Late phase 1 |
 | A5 | Database and persistent identity (see D2) | After phase 1 |
 | A6 | Reconnection strategy (ICE Restart) | Once dropouts become annoying |
