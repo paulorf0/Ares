@@ -1,6 +1,9 @@
 package messages
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"time"
+)
 
 const (
 	TypeRole       = "role"
@@ -23,4 +26,18 @@ type RolePayload struct {
 type RoleMessage struct {
 	Type    string      `json:"type"`
 	Payload RolePayload `json:"payload"`
+}
+
+const (
+	TypeString = "string"
+)
+
+type Message struct {
+	Type    string          `json:"type"`
+	Payload json.RawMessage `json:"payload"`
+
+	// Filled in by the client on send.
+	ClientID   string    `json:"ClientID"`
+	ClientName string    `json:"ClientName"`
+	SendAt     time.Time `json:"CurrentTime"`
 }

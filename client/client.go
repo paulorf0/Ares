@@ -22,11 +22,13 @@ var (
 )
 
 type Client struct {
+	id   string
+	name string
+
 	connWS  *websocket.Conn
 	connRTC *webrtc.PeerConnection
 
-	// channel is written from a callback goroutine and read by whoever wants
-	// to send, so it goes through setChannel/DataChannel.
+	// Set from a pion callback goroutine, so access goes through DataChannel.
 	channelMu sync.Mutex
 	channel   *webrtc.DataChannel
 
@@ -41,8 +43,10 @@ type Client struct {
 	pendingICE []webrtc.ICECandidateInit
 }
 
-func New(signalURL, roomID string) (*Client, error) {
+func New(signalURL, roomID string, id string, name string) (*Client, error) {
 	c := &Client{
+		id:     id,
+		name:   name,
 		roomID: roomID,
 		closed: make(chan struct{}),
 	}
@@ -118,8 +122,7 @@ func (c *Client) createPeer() error {
 		}
 	})
 
-	// Only the answering side reaches this: the offering side creates the
-	// channel itself and never sees OnDataChannel.
+	// Fires only on the answering side; the offering peer creates its own.
 	conn.OnDataChannel(func(dc *webrtc.DataChannel) {
 		c.setChannel(dc)
 		c.setupDataChannel(dc)
@@ -174,7 +177,6 @@ func (c *Client) handle(env messages.Envelope) error {
 		return c.handleRemoteDescription(desc)
 
 	case messages.TypePeerLeft:
-		// With only two peers there is nothing left to negotiate.
 		slog.Warn("peer left before the connection was established")
 		c.closeSignaling()
 		return nil
@@ -192,10 +194,8 @@ func (c *Client) handle(env messages.Envelope) error {
 	}
 }
 
-// startOffer runs on the peer that was already waiting in the room when the
-// second one arrived. That peer owns the data channel; the other side receives
-// it through OnDataChannel. The trigger is the event, not the polite flag:
-// polite only decides who yields on a renegotiation collision later on.
+// startOffer creates the data channel and sends the offer. It runs on the peer
+// that was already in the room when the second one joined.
 func (c *Client) startOffer() error {
 	dc, err := c.connRTC.CreateDataChannel(fmt.Sprintf("CHANNEL-%s", c.roomID), nil)
 	if err != nil {
@@ -208,7 +208,7 @@ func (c *Client) startOffer() error {
 	if err != nil {
 		return fmt.Errorf("create offer: %w", err)
 	}
-	// This is what starts ICE gathering; without it OnICECandidate never fires.
+	// SetLocalDescription is what starts ICE gathering.
 	if err := c.connRTC.SetLocalDescription(offer); err != nil {
 		return fmt.Errorf("set local description: %w", err)
 	}
@@ -280,8 +280,8 @@ func (c *Client) sendEnvelope(msgType string, payload any) error {
 	return c.connWS.WriteMessage(websocket.TextMessage, data)
 }
 
-// closeSignaling tears down the websocket exactly once. It is safe to call from
-// the data channel callback, the read loop and the caller.
+// closeSignaling tears down the websocket once, whichever goroutine gets there
+// first.
 func (c *Client) closeSignaling() {
 	c.closeOnce.Do(func() {
 		close(c.closed)
@@ -309,8 +309,7 @@ func (c *Client) isClosed() bool {
 	}
 }
 
-// Polite reports which side of the Perfect Negotiation pattern this client is
-// on (D3). It is fixed by the server at handshake time.
+// Polite reports the negotiation role assigned by the server at handshake time.
 func (c *Client) Polite() bool {
 	return c.polite
 }
@@ -320,8 +319,8 @@ func (c *Client) ConnectionState() webrtc.PeerConnectionState {
 	return c.connRTC.ConnectionState()
 }
 
-// SignalingClosed reports whether the signaling connection has been torn down,
-// which happens on its own once the data channel opens (D6).
+// SignalingClosed reports whether the signaling connection has been torn down.
+// It closes on its own once the data channel opens.
 func (c *Client) SignalingClosed() bool {
 	return c.isClosed()
 }
@@ -332,8 +331,8 @@ func (c *Client) setChannel(dc *webrtc.DataChannel) {
 	c.channel = dc
 }
 
-// DataChannel returns the negotiated data channel, or nil while the handshake
-// is still in flight.
+// DataChannel returns the negotiated channel, or nil while the handshake is
+// still in flight.
 func (c *Client) DataChannel() *webrtc.DataChannel {
 	c.channelMu.Lock()
 	defer c.channelMu.Unlock()
@@ -347,4 +346,48 @@ func (c *Client) Close() error {
 		return c.connRTC.Close()
 	}
 	return nil
+}
+
+// SendMessage stamps the message with the local identity and sends it over the
+// data channel.
+func (c *Client) SendMessage(msg messages.Message) error {
+	if c.connRTC == nil {
+		return fmt.Errorf("send message: connRTC == nil")
+	}
+
+	channel := c.DataChannel()
+	if channel == nil {
+		return fmt.Errorf("send message: channel == nil")
+	}
+
+	msg.SendAt = time.Now()
+	msg.ClientName = c.name
+	msg.ClientID = c.id
+	raw, err := json.Marshal(msg)
+	if err != nil {
+		return fmt.Errorf("send message: %w", err)
+	}
+
+	err = channel.Send(raw)
+	if err != nil {
+		return fmt.Errorf("channel sendtext: %w", err)
+	}
+
+	return nil
+}
+
+// ReceiveMessage registers fn as the handler for incoming messages. It blocks
+// until the handshake settles, and gives up if no channel was negotiated.
+func (c *Client) ReceiveMessage(fn func(msg []byte)) {
+	<-c.closed
+
+	channel := c.DataChannel()
+	if channel == nil {
+		slog.Warn("no data channel to receive on: signaling ended before the handshake completed")
+		return
+	}
+
+	channel.OnMessage(func(msg webrtc.DataChannelMessage) {
+		fn(msg.Data)
+	})
 }

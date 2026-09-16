@@ -19,9 +19,8 @@ const (
 	waitStep    = 20 * time.Millisecond
 )
 
-// newSignalingServer starts an isolated signaling server on a random port. Every
-// case gets its own hub, so nothing leaks between tests and no fixed port has to
-// be free. Pass 0 to keep the default session timeout.
+// newSignalingServer starts an isolated signaling server on a random port, so
+// cases share no state and need no fixed port. Pass 0 for the default timeout.
 func newSignalingServer(t *testing.T, sessionTimeout time.Duration) string {
 	t.Helper()
 
@@ -33,8 +32,6 @@ func newSignalingServer(t *testing.T, sessionTimeout time.Duration) string {
 	srv := httptest.NewServer(server.Handler(hub))
 	t.Cleanup(srv.Close)
 
-	// The scheme is the only difference: a websocket handshake is a plain HTTP
-	// GET underneath.
 	return "ws" + strings.TrimPrefix(srv.URL, "http")
 }
 
@@ -54,7 +51,7 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 func newClient(t *testing.T, signalURL, room string) *client.Client {
 	t.Helper()
 
-	c, err := client.New(signalURL, room)
+	c, err := client.New(signalURL, room, "test-id", "Tester")
 	if err != nil {
 		t.Fatalf("connect to room %q: %v", room, err)
 	}
@@ -63,8 +60,8 @@ func newClient(t *testing.T, signalURL, room string) *client.Client {
 	return c
 }
 
-// connectedPair brings up two peers in the same room and waits for the WebRTC
-// connection to be established on both sides.
+// connectedPair brings up two peers in the same room and waits for both to
+// reach connected.
 func connectedPair(t *testing.T, room string) (*client.Client, *client.Client) {
 	t.Helper()
 
@@ -94,12 +91,10 @@ func waitForOpenChannels(t *testing.T, peers ...*client.Client) {
 	})
 }
 
-// Room occupancy is transient by design: once a pair finishes the handshake both
-// clients tear signaling down (D6) and the server frees their slots, even though
-// the P2P connection is alive. Raw websocket connections never negotiate
-// anything, so they hold their slots until closed, which is what makes occupancy
-// observable. The role the server hands out reveals it: a peer told it is
-// impolite found the room empty.
+// Room occupancy is transient: a pair that finishes the handshake drops
+// signaling and frees both slots. Raw websocket connections negotiate nothing
+// and hold their slots until closed, which keeps occupancy observable. The role
+// the server hands out reveals it, since an impolite peer found the room empty.
 
 func joinRaw(signalURL, room string) (*websocket.Conn, bool, error) {
 	conn, _, err := websocket.DefaultDialer.Dial(signalURL+"?room="+room, nil)
@@ -129,8 +124,7 @@ func mustJoinRaw(t *testing.T, signalURL, room string) (*websocket.Conn, bool) {
 }
 
 // waitForRawJoin retries until the room accepts a peer, then reports whether it
-// was told it is polite. Closing a connection and the server noticing it are not
-// the same instant.
+// was told it is polite. The server does not notice a close instantly.
 func waitForRawJoin(t *testing.T, signalURL, room string) bool {
 	t.Helper()
 
@@ -148,8 +142,8 @@ func waitForRawJoin(t *testing.T, signalURL, room string) bool {
 	return false
 }
 
-// waitForEmptyRoom polls until a newcomer is told it is impolite, meaning every
-// slot came back.
+// waitForEmptyRoom polls until a newcomer is told it is impolite, meaning both
+// slots came back.
 func waitForEmptyRoom(t *testing.T, signalURL, room string) {
 	t.Helper()
 

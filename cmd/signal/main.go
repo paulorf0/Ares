@@ -1,6 +1,5 @@
-// Command signal runs the Ares signaling server. It only introduces two peers
-// to each other; once they are connected it takes no further part, so it can be
-// shut down as soon as a call is up.
+// Command signal runs the Ares signaling server. It only introduces peers to
+// each other and can be shut down once a call is up.
 package main
 
 import (

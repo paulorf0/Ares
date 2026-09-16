@@ -10,8 +10,8 @@ import (
 	"github.com/paulorf0/Ares/client"
 )
 
-// Client-side behaviour: the WebRTC handshake, the data channel and how failures
-// surface to whoever called New.
+// Client-side behaviour: the handshake, the data channel, and how failures
+// surface to the caller.
 
 func TestFirstPeerIsImpoliteSecondIsPolite(t *testing.T) {
 	signalURL := newSignalingServer(t, 0)
@@ -31,8 +31,8 @@ func TestHandshakeOpensDataChannelOnBothSides(t *testing.T) {
 	a, b := connectedPair(t, "handshake")
 	waitForOpenChannels(t, a, b)
 
-	// The label is chosen by the offering side and reaches the other one in-band
-	// over DCEP, never through the signaling server.
+	// The label is chosen by the offering side and travels in-band, never
+	// through the signaling server.
 	const want = "CHANNEL-handshake"
 	if got := a.DataChannel().Label(); got != want {
 		t.Errorf("offering side label = %q, want %q", got, want)
@@ -77,7 +77,7 @@ func TestDataChannelCarriesTextBothWays(t *testing.T) {
 	}
 }
 
-// D6: the signaling server is only needed for the initial handshake.
+// Signaling is only needed for the initial handshake.
 func TestSignalingClosesOnceDataChannelOpens(t *testing.T) {
 	a, b := connectedPair(t, "teardown")
 	waitForOpenChannels(t, a, b)
@@ -87,14 +87,14 @@ func TestSignalingClosesOnceDataChannelOpens(t *testing.T) {
 	})
 }
 
-// A full room is upgraded first and closed right after, so a successful dial does
-// not mean a valid session. The failure has to surface on the role read.
+// A full room is upgraded first and closed right after, so a successful dial is
+// not a valid session. The failure surfaces on the role read.
 func TestThirdPeerIsRejectedBeforeGettingARole(t *testing.T) {
 	signalURL := newSignalingServer(t, 0)
 	mustJoinRaw(t, signalURL, "full")
 	mustJoinRaw(t, signalURL, "full")
 
-	third, err := client.New(signalURL, "full")
+	third, err := client.New(signalURL, "full", "3", "Third")
 	if err == nil {
 		third.Close()
 		t.Fatal("a third peer was allowed into the room")

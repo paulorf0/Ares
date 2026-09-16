@@ -10,9 +10,9 @@ import (
 	"github.com/paulorf0/Ares/client"
 )
 
-// Server-side behaviour: room capacity, slot bookkeeping, blind relaying and the
-// session deadline. The peers here are mostly raw connections, since what is
-// under test is the server, not WebRTC.
+// Server-side behaviour: room capacity, slot bookkeeping, relaying and the
+// session deadline. The peers are mostly raw connections, since the server is
+// what is under test.
 
 func TestRoomHoldsExactlyTwoPeers(t *testing.T) {
 	signalURL := newSignalingServer(t, 0)
@@ -30,8 +30,8 @@ func TestRoomHoldsExactlyTwoPeers(t *testing.T) {
 	}
 }
 
-// The server must never parse what it forwards: that is what lets audio and
-// video be added later without touching it (D6).
+// The server must never parse what it forwards, so that new message types need
+// no change to it.
 func TestRelayForwardsMessagesBlindly(t *testing.T) {
 	signalURL := newSignalingServer(t, 0)
 
@@ -62,8 +62,8 @@ func TestSlotIsFreedWhenOnePeerLeaves(t *testing.T) {
 
 	first.Close()
 
-	// Polite means the newcomer found the remaining peer: the slot was freed
-	// without evicting anyone else.
+	// Polite means the newcomer found the remaining peer, so the slot was freed
+	// without evicting anyone.
 	if !waitForRawJoin(t, signalURL, "slots") {
 		t.Error("the rejoining peer should have found the remaining one")
 	}
@@ -81,8 +81,8 @@ func TestRoomIsReleasedWhenBothPeersLeave(t *testing.T) {
 	waitForEmptyRoom(t, signalURL, "release")
 }
 
-// D6 in reverse: finishing the handshake is what releases the room, because both
-// clients drop signaling as soon as the data channel opens.
+// Finishing the handshake releases the room, since both clients drop signaling
+// as soon as the data channel opens.
 func TestRoomIsReleasedOnceTheHandshakeCompletes(t *testing.T) {
 	signalURL := newSignalingServer(t, 0)
 
@@ -93,17 +93,17 @@ func TestRoomIsReleasedOnceTheHandshakeCompletes(t *testing.T) {
 	waitForEmptyRoom(t, signalURL, "handoff")
 }
 
-// A peer disconnecting while the other is still relaying used to crash the
-// server with "send on closed channel". Churn plus traffic is what exposed it.
+// A peer disconnecting while the other is still relaying once crashed the
+// server with "send on closed channel".
 func TestPeerChurnDoesNotBreakTheServer(t *testing.T) {
 	signalURL := newSignalingServer(t, 0)
 
 	for i := 0; i < 20; i++ {
-		a, err := client.New(signalURL, "churn")
+		a, err := client.New(signalURL, "churn", "1", "First")
 		if err != nil {
 			t.Fatalf("iteration %d, first peer: %v", i, err)
 		}
-		b, err := client.New(signalURL, "churn")
+		b, err := client.New(signalURL, "churn", "2", "Second")
 		if err != nil {
 			t.Fatalf("iteration %d, second peer: %v", i, err)
 		}
@@ -113,7 +113,7 @@ func TestPeerChurnDoesNotBreakTheServer(t *testing.T) {
 		b.Close()
 	}
 
-	// The server has to still be serving, and the room free, after all that.
+	// The server must still be serving, and the room free.
 	if waitForRawJoin(t, signalURL, "churn") {
 		t.Error("the room should be empty after the churn")
 	}
@@ -122,7 +122,7 @@ func TestPeerChurnDoesNotBreakTheServer(t *testing.T) {
 func TestEmptyRoomCodeIsRejectedAtHandshake(t *testing.T) {
 	signalURL := newSignalingServer(t, 0)
 
-	c, err := client.New(signalURL, "")
+	c, err := client.New(signalURL, "", "1", "First")
 	if err == nil {
 		c.Close()
 		t.Fatal("an empty room code was accepted")
@@ -132,13 +132,12 @@ func TestEmptyRoomCodeIsRejectedAtHandshake(t *testing.T) {
 	}
 }
 
-// D10: a peer whose network dies never sends a close frame, so its slot would be
-// held until TCP gives up. The absolute deadline is what releases it.
+// A peer whose network dies sends no close frame, so its slot would be held
+// until TCP gives up. The absolute deadline releases it.
 func TestStalePeerIsDroppedWhenTheSessionTimesOut(t *testing.T) {
 	signalURL := newSignalingServer(t, 200*time.Millisecond)
 
-	// One peer alone: nobody comes to meet it, so the handshake never starts and
-	// the connection just sits there holding a slot.
+	// Nobody comes to meet this peer, so it sits holding a slot.
 	stale := newClient(t, signalURL, "stale")
 	if stale.Polite() {
 		t.Error("a peer alone in a room should be impolite")
@@ -147,7 +146,7 @@ func TestStalePeerIsDroppedWhenTheSessionTimesOut(t *testing.T) {
 	waitForEmptyRoom(t, signalURL, "stale")
 }
 
-// The deadline must not cut a handshake that is simply taking its time.
+// The deadline must not cut a handshake that is merely slow.
 func TestSessionTimeoutDoesNotCutAHealthyHandshake(t *testing.T) {
 	signalURL := newSignalingServer(t, 10*time.Second)
 

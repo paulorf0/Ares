@@ -1,7 +1,6 @@
-// Package server introduces two peers to each other so they can exchange SDP and
-// establish a connection.
-// Once the peers are connected, the server no longer takes part in the session.
-// It keeps track of the open rooms so that peers can find each other by room code.
+// Package server pairs two peers by room code and relays signaling between them
+// until they are connected. It never parses what it forwards, and takes no part
+// in the session once the peers are talking directly.
 package server
 
 import (
@@ -20,10 +19,9 @@ import (
 const (
 	sendBuffer = 16
 
-	// defaultSessionTimeout bounds how long a peer may hold a room slot. By D6
-	// signaling only lives through the handshake, so anything still connected
-	// after this is a ghost: a peer whose network died without a close frame.
-	// TCP on its own would take about two hours to notice.
+	// Signaling lasts only as long as the handshake, so a peer still connected
+	// after this lost its network without sending a close frame. TCP alone
+	// takes about two hours to notice.
 	defaultSessionTimeout = 5 * time.Minute
 )
 
@@ -33,6 +31,8 @@ type Peer struct {
 	polite bool
 	roomID string
 
+	// Closed once when the peer is finished. The send channel is deliberately
+	// left open: closing it would panic the other peer's relay mid-write.
 	done      chan struct{}
 	closeOnce sync.Once
 }
@@ -46,8 +46,8 @@ func newPeer(conn *websocket.Conn, roomID string) *Peer {
 	}
 }
 
-// enqueue hands a message to the peer's writePump. It is a no-op once the peer
-// is gone, so relaying to a peer that just disconnected is always safe.
+// enqueue hands a message to the peer's writePump, or drops it if the peer is
+// already gone.
 func (p *Peer) enqueue(data []byte) {
 	select {
 	case p.send <- data:
@@ -84,8 +84,7 @@ type Hub struct {
 	mu    sync.Mutex
 	rooms map[string]*Room
 
-	// sessionTimeout is the absolute read deadline given to every peer. Zero
-	// disables it.
+	// Absolute read deadline given to every peer. Zero disables it.
 	sessionTimeout time.Duration
 }
 
@@ -127,18 +126,16 @@ func (h *Hub) join(roomID string, p *Peer) (*Room, *Peer) {
 		return nil, nil
 	}
 
-	// Perfect Negotiation (D3): whoever finds someone already in the room is
-	// the polite one. Derived from occupancy so it stays correct after a peer
-	// leaves and the slot is reused.
+	// Derived from occupancy rather than a counter, so it stays correct after a
+	// peer leaves and its slot is reused.
 	p.polite = other != nil
 	room.peers[slot] = p
 
 	return room, other
 }
 
-// leave frees p's slot and returns the peer still in the room, if any. An empty
-// room is dropped from the hub, otherwise its slots would stay occupied by
-// ghosts and every later join would be told the room is full.
+// leave frees p's slot and returns the peer still in the room, if any. Empty
+// rooms are dropped so their codes become reusable.
 func (h *Hub) leave(p *Peer) *Peer {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -168,8 +165,8 @@ func (h *Hub) leave(p *Peer) *Peer {
 	return other
 }
 
-// Handler returns the signaling HTTP handler for hub. Server mounts it on /ws;
-// callers that bring their own mux, tests included, can mount it themselves.
+// Handler returns the signaling HTTP handler for hub, for callers that bring
+// their own mux.
 func Handler(hub *Hub) http.HandlerFunc {
 	return handleWS(hub)
 }
@@ -198,9 +195,8 @@ func handleWS(hub *Hub) http.HandlerFunc {
 			return
 		}
 
-		// Absolute, never refreshed: it bounds the whole signaling session
-		// rather than the gap between messages. A sliding deadline would keep a
-		// stalled handshake alive forever as long as candidates trickle in.
+		// Never refreshed, so it bounds the whole session rather than the gap
+		// between messages.
 		if hub.sessionTimeout > 0 {
 			if err := conn.SetReadDeadline(time.Now().Add(hub.sessionTimeout)); err != nil {
 				log.Println("[SetReadDeadline]: ", err)
@@ -235,16 +231,15 @@ func handleWS(hub *Hub) http.HandlerFunc {
 		}
 		data, err := json.Marshal(role)
 		if err != nil {
-			// Without a role the client blocks forever waiting for it, so this
-			// has to end the connection rather than be ignored.
+			// The client blocks waiting for its role, so drop the connection
+			// instead of leaving it hanging.
 			log.Println("[Role Marshal]: ", err)
 			return
 		}
 		peer.enqueue(data)
 
-		// The peer that was already waiting is the one that starts the offer,
-		// so it needs to know the room filled up. The peer that just joined
-		// needs no notice: it knows it joined.
+		// The waiting peer starts the offer, so it needs to know the room
+		// filled up.
 		if other != nil {
 			notify(other, messages.TypePeerJoined)
 		}
@@ -269,10 +264,8 @@ func readPump(p *Peer, room *Room) {
 	for {
 		_, data, err := p.conn.ReadMessage()
 		if err != nil {
-			// Either way the deferred leave frees the slot; the distinction is
-			// only there to tell a ghost apart from a peer that said goodbye.
-			// gorilla replaces a timeout with its own error type, which keeps
-			// no wrapped cause: net.Error is the only thing left to match on.
+			// gorilla replaces timeouts with its own error type and keeps no
+			// wrapped cause, so net.Error is all there is to match on.
 			var netErr net.Error
 			if errors.As(err, &netErr) && netErr.Timeout() {
 				log.Println("[ReadPump] session timed out, releasing the room slot")
@@ -282,8 +275,6 @@ func readPump(p *Peer, room *Room) {
 			return
 		}
 
-		// The payload stays opaque here: the server relays bytes and never
-		// parses SDP, which is what lets media be added without touching it.
 		if peer := room.other(p); peer != nil {
 			peer.enqueue(data)
 		}
