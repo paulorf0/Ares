@@ -32,6 +32,10 @@ type Client struct {
 	channelMu sync.Mutex
 	channel   *webrtc.DataChannel
 
+	// Registered by the caller, invoked from a pion callback goroutine.
+	handlerMu sync.Mutex
+	onMessage func(msg []byte)
+
 	polite bool
 	roomID string
 
@@ -142,7 +146,15 @@ func (c *Client) setupDataChannel(dc *webrtc.DataChannel) {
 	})
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
-		fmt.Println(string(msg.Data))
+		c.handlerMu.Lock()
+		handler := c.onMessage
+		c.handlerMu.Unlock()
+
+		if handler == nil {
+			slog.Warn("incoming message dropped: no handler registered")
+			return
+		}
+		handler(msg.Data)
 	})
 }
 
@@ -376,18 +388,11 @@ func (c *Client) SendMessage(msg messages.Message) error {
 	return nil
 }
 
-// ReceiveMessage registers fn as the handler for incoming messages. It blocks
-// until the handshake settles, and gives up if no channel was negotiated.
+// ReceiveMessage registers fn as the handler for incoming messages. It returns
+// right away and can be called before the channel exists; messages that arrive
+// with no handler set are dropped.
 func (c *Client) ReceiveMessage(fn func(msg []byte)) {
-	<-c.closed
-
-	channel := c.DataChannel()
-	if channel == nil {
-		slog.Warn("no data channel to receive on: signaling ended before the handshake completed")
-		return
-	}
-
-	channel.OnMessage(func(msg webrtc.DataChannelMessage) {
-		fn(msg.Data)
-	})
+	c.handlerMu.Lock()
+	defer c.handlerMu.Unlock()
+	c.onMessage = fn
 }

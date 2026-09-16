@@ -158,6 +158,17 @@ without binding a fixed port.
 
 **Closes A3.**
 
+### D12 - License: MPL-2.0
+
+The Mozilla Public License 2.0, with the full text in `LICENSE`.
+
+**Rationale:** file-level copyleft. Changes to files that are part of Ares have
+to stay open, which keeps improvements flowing back, while the code can still be
+used next to software under other licenses. MIT was considered too permissive
+for the first half, AGPL too restrictive for the second.
+
+**Closes A2.**
+
 ---
 
 ## Open decisions
@@ -165,7 +176,6 @@ without binding a fixed port.
 | # | Decision | When to decide |
 |---|----------|----------------|
 | A1 | Interface: TUI (bubbletea) or plain CLI | Before phase 1 becomes usable |
-| A2 | License (MIT vs AGPL) | Before the first public push |
 | A4 | Local message history (SQLite / file / none) | Late phase 1 |
 | A5 | Database and persistent identity (see D2) | After phase 1 |
 | A6 | Reconnection strategy (ICE Restart) | Once dropouts become annoying |

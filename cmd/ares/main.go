@@ -18,6 +18,9 @@ import (
 // Messages in a session are all from today, so the date would only add noise.
 const timeLayout = "15:04:05"
 
+// How long to wait for pending messages to leave before shutting down.
+const flushTimeout = 2 * time.Second
+
 func showClient(name string, id string, sentAt time.Time) {
 	fmt.Printf("[%s] %s(%s): ", sentAt.Local().Format(timeLayout), name, id)
 }
@@ -73,27 +76,23 @@ func main() {
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
 	msgChan := readInput()
+
+	// Closed when stdin runs out, which is one of the two ways the program ends.
+	inputDone := make(chan struct{})
+
 	go func() {
-		for {
-			select {
-			case <-stop:
-				return
+		defer close(inputDone)
 
-			case msg, ok := <-msgChan:
-				if !ok {
-					return
-				}
+		for msg := range msgChan {
+			rawMsg, err := json.Marshal(msg)
+			if err != nil {
+				log.Printf("encode message payload: %v", err)
+				continue
+			}
 
-				rawMsg, err := json.Marshal(msg)
-				if err != nil {
-					log.Printf("encode message payload: %v", err)
-					continue
-				}
-
-				envelope := messages.Message{Type: messages.TypeString, Payload: rawMsg}
-				if err := c.SendMessage(envelope); err != nil {
-					log.Printf("send message: %v", err)
-				}
+			envelope := messages.Message{Type: messages.TypeString, Payload: rawMsg}
+			if err := c.SendMessage(envelope); err != nil {
+				log.Printf("send message: %v", err)
 			}
 		}
 	}()
@@ -107,5 +106,25 @@ func main() {
 		showMessage(envelope)
 	})
 
-	<-stop
+	select {
+	case <-stop:
+	case <-inputDone:
+	}
+
+	flush(c)
+}
+
+// flush waits for the data channel to drain so a message sent just before exit
+// still reaches the peer. Sending only queues the data; closing the connection
+// right after would drop whatever is still in the buffer.
+func flush(c *client.Client) {
+	channel := c.DataChannel()
+	if channel == nil {
+		return
+	}
+
+	deadline := time.Now().Add(flushTimeout)
+	for channel.BufferedAmount() > 0 && time.Now().Before(deadline) {
+		time.Sleep(10 * time.Millisecond)
+	}
 }
