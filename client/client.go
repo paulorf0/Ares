@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/url"
 	"sync"
@@ -11,6 +12,11 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/paulorf0/Ares/messages"
+	"github.com/pion/interceptor"
+	"github.com/pion/mediadevices"
+	"github.com/pion/mediadevices/pkg/codec/opus"
+	_ "github.com/pion/mediadevices/pkg/driver/microphone"
+	"github.com/pion/mediadevices/pkg/prop"
 	"github.com/pion/webrtc/v4"
 )
 
@@ -35,6 +41,12 @@ type Client struct {
 	// Registered by the caller, invoked from a pion callback goroutine.
 	handlerMu sync.Mutex
 	onMessage func(msg []byte)
+	onAudio   func(frame []byte)
+
+	// Microphone capture and the codecs it was set up with; the same selector
+	// populates the MediaEngine so the SDP only offers what can be encoded.
+	codecAudio *mediadevices.CodecSelector
+	audioTrack *mediadevices.AudioTrack
 
 	polite bool
 	roomID string
@@ -55,15 +67,22 @@ func New(signalURL, roomID string, id string, name string) (*Client, error) {
 		closed: make(chan struct{}),
 	}
 
-	if err := c.connect(signalURL, roomID); err != nil {
-		return nil, err
-	}
-	if err := c.createPeer(); err != nil {
+	//if err := c.connect(signalURL, roomID); err != nil {
+	//	return nil, err
+	//}
+	if err := c.captureAudio(); err != nil {
 		c.closeSignaling()
 		return nil, err
 	}
-
-	go c.readPump()
+	if err := c.createPeer(); err != nil {
+		c.Close()
+		return nil, err
+	}
+	if err := c.addAudioTrack(); err != nil {
+		c.Close()
+		return nil, err
+	}
+	//go c.readPump()
 
 	return c, nil
 }
@@ -110,11 +129,34 @@ func (c *Client) createPeer() error {
 		},
 	}
 
-	conn, err := webrtc.NewPeerConnection(config)
+	mediaEngine := &webrtc.MediaEngine{}
+	c.codecAudio.Populate(mediaEngine)
+
+	// A custom MediaEngine skips pion's defaults, so NACK and RTCP reports
+	// have to be registered by hand.
+	registry := &interceptor.Registry{}
+	if err := webrtc.RegisterDefaultInterceptors(mediaEngine, registry); err != nil {
+		return fmt.Errorf("register interceptors: %w", err)
+	}
+
+	api := webrtc.NewAPI(
+		webrtc.WithMediaEngine(mediaEngine),
+		webrtc.WithInterceptorRegistry(registry),
+	)
+
+	conn, err := api.NewPeerConnection(config)
 	if err != nil {
 		return fmt.Errorf("new peer connection: %w", err)
 	}
 	c.connRTC = conn
+
+	conn.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
+		slog.Info("remote track", "kind", track.Kind().String(), "codec", track.Codec().MimeType)
+		if track.Kind() != webrtc.RTPCodecTypeAudio {
+			return
+		}
+		c.readRemoteAudio(track)
+	})
 
 	conn.OnICECandidate(func(candidate *webrtc.ICECandidate) {
 		if candidate == nil {
@@ -351,13 +393,19 @@ func (c *Client) DataChannel() *webrtc.DataChannel {
 	return c.channel
 }
 
-// Close releases both the signaling connection and the peer connection.
+// Close releases the signaling connection, the peer connection and the
+// microphone.
 func (c *Client) Close() error {
 	c.closeSignaling()
+
+	var err error
 	if c.connRTC != nil {
-		return c.connRTC.Close()
+		err = c.connRTC.Close()
 	}
-	return nil
+	if c.audioTrack != nil {
+		err = errors.Join(err, c.audioTrack.Close())
+	}
+	return err
 }
 
 // SendMessage stamps the message with the local identity and sends it over the
@@ -395,4 +443,95 @@ func (c *Client) ReceiveMessage(fn func(msg []byte)) {
 	c.handlerMu.Lock()
 	defer c.handlerMu.Unlock()
 	c.onMessage = fn
+}
+
+// ReceiveAudio registers fn as the handler for incoming audio. Each call carries
+// one Opus packet taken from the remote track's RTP payload; frames that arrive
+// with no handler set are dropped.
+func (c *Client) ReceiveAudio(fn func(frame []byte)) {
+	c.handlerMu.Lock()
+	defer c.handlerMu.Unlock()
+	c.onAudio = fn
+}
+
+// captureAudio opens the microphone with an Opus encoder attached.
+func (c *Client) captureAudio() error {
+	opusParams, err := opus.NewParams()
+	if err != nil {
+		return fmt.Errorf("opus params: %w", err)
+	}
+	codecSelector := mediadevices.NewCodecSelector(mediadevices.WithAudioEncoders(&opusParams))
+
+	stream, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
+		Audio: func(constraints *mediadevices.MediaTrackConstraints) {
+			constraints.SampleRate = prop.Int(48000)
+			constraints.ChannelCount = prop.Int(2)
+		},
+		Codec: codecSelector,
+	})
+	if err != nil {
+		return fmt.Errorf("get user media: %w", err)
+	}
+
+	tracks := stream.GetAudioTracks()
+	if len(tracks) == 0 {
+		return errors.New("get user media: no audio track")
+	}
+	audioTrack, ok := tracks[0].(*mediadevices.AudioTrack)
+	if !ok {
+		tracks[0].Close()
+		return fmt.Errorf("get user media: unexpected track type %T", tracks[0])
+	}
+
+	c.codecAudio = codecSelector
+	c.audioTrack = audioTrack
+	return nil
+}
+
+// addAudioTrack attaches the microphone track to the peer connection. AddTrack
+// makes the transceiver sendrecv, so both peers can talk after the first
+// negotiation.
+func (c *Client) addAudioTrack() error {
+	if c.connRTC == nil {
+		return errors.New("add audio track: connRTC == nil")
+	}
+
+	sender, err := c.connRTC.AddTrack(c.audioTrack)
+	if err != nil {
+		return fmt.Errorf("add audio track: %w", err)
+	}
+
+	// RTCP feedback for the sender is only processed while something reads it.
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			if _, _, err := sender.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+
+	return nil
+}
+
+// readRemoteAudio hands each RTP payload of the remote track to the audio
+// handler until the track ends.
+func (c *Client) readRemoteAudio(track *webrtc.TrackRemote) {
+	for {
+		pkt, _, err := track.ReadRTP()
+		if err != nil {
+			if !errors.Is(err, io.EOF) {
+				slog.Error("read remote audio", "error", err)
+			}
+			return
+		}
+
+		c.handlerMu.Lock()
+		fn := c.onAudio
+		c.handlerMu.Unlock()
+
+		if fn != nil {
+			fn(pkt.Payload)
+		}
+	}
 }

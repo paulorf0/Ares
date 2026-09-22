@@ -1,5 +1,5 @@
-github.com/blackjack/webcam v0.6.1 h1:K0T6Q0zto23U99gNAa5q/hFoye6uGcKr2aE6hFoxVoE=
-github.com/blackjack/webcam v0.6.1/go.mod h1:zs+RkUZzqpFPHPiwBZ6U5B34ZXXe9i+SiHLKnnukJuI=
+github.com/gen2brain/malgo v0.11.24 h1:hHcIJVfzWcEDHFdPl5Dl/CUSOjzOleY0zzAV8Kx+imE=
+github.com/gen2brain/malgo v0.11.24/go.mod h1:f9TtuN7DVrXMiV/yIceMeWpvanyVzJQMlBecJFVMxww=
 github.com/google/uuid v1.6.0 h1:NIvaJDMOsjHA8n1jAhLSgzrAzy1Hgr+hNrb57e+94F0=
 github.com/google/uuid v1.6.0/go.mod h1:TIyPZe4MgqvfeYDBFedMoGGpEw/LqOeaOT+nhxU+yHo=
 github.com/gorilla/websocket v1.5.3 h1:saDtZ6Pbx/0u+bgYQ3q96pZgCzfhKXGPqt7kZ72aNNg=

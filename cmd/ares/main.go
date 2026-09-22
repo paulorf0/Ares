@@ -48,70 +48,22 @@ func showMessage(envelope messages.Message) {
 func main() {
 	signalURL := flag.String("signal", "ws://localhost:8080/ws",
 		"signaling server address (use the ngrok wss:// url to reach another network)")
-	room := flag.String("room", "", "room code to create or join")
-	id := flag.String("id", "", "client id")
-	name := flag.String("name", "", "client name")
-	flag.Parse()
 
-	if *room == "" {
-		log.Fatal("a room code is required: pass -room")
-	}
-	if *id == "" {
-		log.Fatal("missing id: pass -id")
-	}
-	if *name == "" {
-		log.Fatal("missing name: pass -name")
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
-	}
-
-	c, err := client.New(*signalURL, *room, *id, *name)
+	room := "123"
+	id := "1"
+	name := "ferlin"
+	c, err := client.New(*signalURL, room, id, name)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer c.Close()
 
-	log.Printf("joined room %q, waiting for the other peer", *room)
+	//c.CreateAudioTrack()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
-
-	msgChan := readInput()
-
-	// Closed when stdin runs out, which is one of the two ways the program ends.
-	inputDone := make(chan struct{})
-
-	go func() {
-		defer close(inputDone)
-
-		for msg := range msgChan {
-			rawMsg, err := json.Marshal(msg)
-			if err != nil {
-				log.Printf("encode message payload: %v", err)
-				continue
-			}
-
-			envelope := messages.Message{Type: messages.TypeString, Payload: rawMsg}
-			if err := c.SendMessage(envelope); err != nil {
-				log.Printf("send message: %v", err)
-			}
-		}
-	}()
-
-	c.ReceiveMessage(func(msg []byte) {
-		var envelope messages.Message
-		if err := json.Unmarshal(msg, &envelope); err != nil {
-			log.Printf("decode incoming message: %v", err)
-			return
-		}
-		showMessage(envelope)
-	})
-
-	select {
-	case <-stop:
-	case <-inputDone:
-	}
-
-	flush(c)
+	<-stop
 }
 
 // flush waits for the data channel to drain so a message sent just before exit
