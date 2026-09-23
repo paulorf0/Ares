@@ -27,9 +27,10 @@ camera and screen capture trivial (`getUserMedia`/`getDisplayMedia`), but it
 hides the very layer we want to study.
 
 **Accepted cost:** in phases 2 and 3, Go has no native device capture or
-encoders. This will require CGO with GStreamer/ffmpeg, or revisiting the
-decision. Revisit specifically when reaching **video** (audio via Opus is
-feasible in pure Go).
+encoders. Audio already needs CGO: miniaudio for capture, libopus for encoding
+and the WebRTC APM for processing (D13), so every build needs a C/C++ compiler
+and cross-compiling needs a cross toolchain. Revisit specifically when reaching
+**video**.
 
 ### D2 - Identity: ephemeral room code
 
@@ -143,6 +144,7 @@ becomes annoying in practice.
 client/       WebRTC peer: signaling handshake, data channel
 server/       signaling hub: rooms, roles, blind relay
 messages/     wire format shared by both
+microphone/   capture driver for mediadevices (D13)
 cmd/ares/     client binary
 cmd/signal/   server binary
 tests/        every test, external to the packages it exercises
@@ -168,6 +170,32 @@ used next to software under other licenses. MIT was considered too permissive
 for the first half, AGPL too restrictive for the second.
 
 **Closes A2.**
+
+### D13 - Audio pipeline: own microphone driver plus WebRTC APM
+
+```
+mic (malgo) -> microphone/ driver -> APM capture -> Opus -> RTP
+RTP -> Opus decode -> APM render -> speaker
+```
+
+- **Capture:** `microphone/` replaces mediadevices' microphone driver, which
+  drops devices whose native format is not F32/S16 (PipeWire exposes S32).
+  Every device advertises F32/S16 at 48 kHz and miniaudio converts. Works the
+  same on WASAPI (Windows) and PulseAudio/PipeWire/ALSA (Linux).
+- **Processing:** the WebRTC Audio Processing Module, through
+  `github.com/livekit/livekit-cli/v2/pkg/apm` (Apache-2.0, bundles the C++
+  sources, no system library). Echo cancellation, noise suppression, automatic
+  gain and high-pass filter, in 10 ms frames of 48 kHz int16.
+
+**Rationale:** raw laptop microphones are noisy and often over-gained, and a
+laptop speaker feeds the remote voice back into the microphone. Discord works
+on the same hardware because it runs this processing; Ares has to as well.
+RNNoise removed more steady noise in a test but does neither echo nor gain.
+
+**Accepted cost:** cgo with a C++ compiler (MinGW-w64 on Windows), ~45 s for
+the first build, ~12 MB more binary. Echo cancellation only works once received
+audio is played back, because every played frame must go through the render
+side.
 
 ---
 
@@ -200,8 +228,17 @@ contradicts the project's premise.
 5. Message envelope (D4) and the polite/impolite role (D3).
 
 ### Phase 2 - Audio and video
-- `AddTrack` / `OnTrack`.
-- Renegotiation over the DataChannel (D6).
+- ~~Microphone capture and Opus encoding~~ (done, D13).
+- ~~`AddTrack` / `OnTrack`~~ (done: a sendrecv audio track added before the
+  first offer; remote RTP payloads reach `ReceiveAudio`).
+- WebRTC APM on the capture side: noise suppression, gain, high-pass (D13).
+- Opus decoding and playback, still undecided: `pion/opus` (pure Go, maturity
+  unverified) or `hraban/opus` (needs a system libopus).
+- APM render side and echo cancellation, once playback exists.
+- Audio opt-in instead of inside `client.New`, so tests and text-only sessions
+  do not open the microphone.
+- Renegotiation over the DataChannel (D6), so a call can start after the
+  connection is up.
 - Decision point for revisiting D1 (capture and encoding in Go).
 
 ### Phase 3 - Screen sharing with audio
