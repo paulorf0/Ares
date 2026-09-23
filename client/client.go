@@ -12,10 +12,10 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/paulorf0/Ares/messages"
+	_ "github.com/paulorf0/Ares/microphone"
 	"github.com/pion/interceptor"
 	"github.com/pion/mediadevices"
 	"github.com/pion/mediadevices/pkg/codec/opus"
-	_ "github.com/pion/mediadevices/pkg/driver/microphone"
 	"github.com/pion/mediadevices/pkg/prop"
 	"github.com/pion/webrtc/v4"
 )
