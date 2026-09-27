@@ -1,5 +1,5 @@
-// Package voice cleans up microphone audio with the WebRTC APM. Playback will
-// go through the same Processor later, since echo cancellation needs both.
+// Package voice cleans up call audio with the WebRTC APM. Mic and speaker go
+// through the same Processor, since echo cancellation needs to see both.
 package voice
 
 import (
@@ -16,7 +16,14 @@ import (
 // FrameSamples is 10 ms at 48 kHz, the only frame size the APM accepts.
 const FrameSamples = 480
 
-var errClosed = errors.New("voice: processor closed")
+// streamDelayMs is a starting guess for speaker-to-mic delay: one output and
+// one input period plus slack. The echo canceller refines it on its own.
+const streamDelayMs = 40
+
+var (
+	errClosed    = errors.New("voice: processor closed")
+	errFrameSize = errors.New("voice: render frames must be 10 ms")
+)
 
 // Processor wraps one APM. Close can run while audio is still flowing.
 type Processor struct {
@@ -27,11 +34,11 @@ type Processor struct {
 	warned atomic.Bool
 }
 
-// New creates a mono Processor. Echo cancellation stays off until we play
-// audio back.
+// New creates a mono Processor with echo cancellation, noise suppression,
+// automatic gain and a high-pass filter.
 func New() (*Processor, error) {
 	a, err := apm.NewAPM(apm.APMConfig{
-		EchoCanceller:   false,
+		EchoCanceller:   true,
 		GainController:  true,
 		HighPassFilter:  true,
 		NoiseSuppressor: true,
@@ -41,7 +48,24 @@ func New() (*Processor, error) {
 	if err != nil {
 		return nil, err
 	}
+	a.SetStreamDelayMs(streamDelayMs)
 	return &Processor{apm: a}, nil
+}
+
+// Render shows the APM a 10 ms frame right before the speaker plays it, so its
+// echo can be removed from the mic. The frame may be adjusted in place; play
+// it as it comes back.
+func (p *Processor) Render(frame []int16) error {
+	if len(frame) != FrameSamples {
+		return errFrameSize
+	}
+
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.apm == nil {
+		return errClosed
+	}
+	return p.apm.ProcessRender(frame)
 }
 
 // CaptureTransform cuts the mic audio into 10 ms frames and cleans each one.

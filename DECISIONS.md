@@ -145,6 +145,9 @@ client/       WebRTC peer: signaling handshake, data channel
 server/       signaling hub: rooms, roles, blind relay
 messages/     wire format shared by both
 microphone/   capture driver for mediadevices (D13)
+voice/        WebRTC APM: noise, gain, echo (D13)
+speaker/      reorders, decodes and plays received audio (D14)
+hotkey/       global push-to-talk key, used only by cmd/ares (D15)
 cmd/ares/     client binary
 cmd/signal/   server binary
 tests/        every test, external to the packages it exercises
@@ -193,9 +196,57 @@ on the same hardware because it runs this processing; Ares has to as well.
 RNNoise removed more steady noise in a test but does neither echo nor gain.
 
 **Accepted cost:** cgo with a C++ compiler (MinGW-w64 on Windows), ~45 s for
-the first build, ~12 MB more binary. Echo cancellation only works once received
-audio is played back, because every played frame must go through the render
-side.
+the first build, ~12 MB more binary. Every frame the speaker plays goes through
+the render side, on the audio thread.
+
+### D14 - Opus decoding with pion/opus, audio as an option of `New`
+
+Received audio is decoded with `github.com/pion/opus` v0.1.0 (pure Go, SILK,
+CELT and hybrid, int16 at 48 kHz) and played through malgo, in a `speaker/`
+package that mirrors `microphone/`. Packets are put back in order by a small
+buffer of its own (a 2-packet wait, 80 ms prebuffer, 200 ms cap against clock
+drift). pion's `samplebuilder` was dropped: it holds each packet until the
+next one arrives, which cut word endings before every push-to-talk pause.
+
+Audio is turned on with `client.New(..., WithAudio())`. It has to be decided
+before the first offer: with no renegotiation yet (D6), a track added later
+would never reach the other peer.
+
+**Rationale:** no cgo and no system library, same organization as the rest of
+the stack. `hraban/opus` needs libopus installed, which is painful on Windows.
+
+**Accepted cost:** v0.1.0 has no packet loss concealment, so a lost packet
+plays as 20 ms of silence (a click). `DecodePLC` exists upstream but is not
+released yet; the silence is kept in one place so the swap is local.
+
+### D15 - Voice modes: open mic or push-to-talk
+
+Two modes: the mic always transmits, or it transmits only while a key is held.
+The client exposes the mode and a talking flag; reading the key is done by a
+`hotkey/` package used only by `cmd/ares`, through `golang.design/x/hotkey`
+(global key, works with the terminal unfocused). The key is set by flag.
+
+Muting uses `RTPSender.ReplaceTrack(nil)`: the track is unbound, mediadevices
+stops its encoder goroutine, and the APM and Opus stop running. The mic device
+stays open, so talking again is instant.
+
+**Rationale:** an open mic costs a few % of a core for the whole session;
+push-to-talk costs nothing while silent, and it is what gaming voice apps use.
+Keeping the keyboard out of the client keeps X11 out of the library and tests.
+
+The key is grabbed before joining the room, so a taken key fails without
+touching the other peer, and push-to-talk is set with `WithVoiceMode` at
+creation, so nothing is sent before the first key press.
+
+Measured on a Ryzen 5 7535HS: a call with an open mic costs ~10% of one core
+per peer, about half capture and half playback. A silent push-to-talk peer
+drops the capture half.
+
+**Accepted cost:** global keys work on Windows and Linux X11, not on Wayland,
+where push-to-talk fails with a message instead of silently opening the mic.
+The key must include a modifier, and it is grabbed from the rest of the system
+while Ares runs. Desktops take common combinations (XFCE owns Ctrl+F1..F12),
+so the suggested default is `ctrl+shift+f9`.
 
 ---
 
@@ -230,13 +281,13 @@ contradicts the project's premise.
 ### Phase 2 - Audio and video
 - ~~Microphone capture and Opus encoding~~ (done, D13).
 - ~~`AddTrack` / `OnTrack`~~ (done: a sendrecv audio track added before the
-  first offer; remote RTP payloads reach `ReceiveAudio`).
-- WebRTC APM on the capture side: noise suppression, gain, high-pass (D13).
-- Opus decoding and playback, still undecided: `pion/opus` (pure Go, maturity
-  unverified) or `hraban/opus` (needs a system libopus).
-- APM render side and echo cancellation, once playback exists.
-- Audio opt-in instead of inside `client.New`, so tests and text-only sessions
-  do not open the microphone.
+  first offer).
+- ~~WebRTC APM: noise suppression, gain, high-pass, echo cancellation~~ (done, D13).
+- ~~Opus decoding and playback~~ (done, D14).
+- ~~Audio opt-in with `WithAudio`~~ (done, D14).
+- ~~Open mic or push-to-talk~~ (done, D15).
+- A voice call tested between two machines on different networks.
+- Packet loss concealment once `pion/opus` releases `DecodePLC`.
 - Renegotiation over the DataChannel (D6), so a call can start after the
   connection is up.
 - Decision point for revisiting D1 (capture and encoding in Go).

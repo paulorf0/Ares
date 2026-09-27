@@ -2,16 +2,19 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"flag"
 	"fmt"
 	"log"
 	"os"
 	"os/signal"
+	"sync/atomic"
 	"syscall"
 	"time"
 
 	"github.com/paulorf0/Ares/client"
+	"github.com/paulorf0/Ares/hotkey"
 	"github.com/paulorf0/Ares/messages"
 )
 
@@ -48,22 +51,101 @@ func showMessage(envelope messages.Message) {
 func main() {
 	signalURL := flag.String("signal", "ws://localhost:8080/ws",
 		"signaling server address (use the ngrok wss:// url to reach another network)")
+	room := flag.String("room", "", "room code to create or join")
+	id := flag.String("id", "", "client id")
+	name := flag.String("name", "", "client name")
+	audio := flag.Bool("audio", false, "join with voice: send the mic and play the other peer")
+	pttKey := flag.String("ptt-key", "",
+		"push-to-talk key, like ctrl+shift+f9; talk only while it is held (needs -audio)")
+	flag.Parse()
 
-	stop := make(chan os.Signal, 1)
-	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+	if *room == "" {
+		log.Fatal("a room code is required: pass -room")
+	}
+	if *id == "" {
+		log.Fatal("missing id: pass -id")
+	}
+	if *name == "" {
+		log.Fatal("missing name: pass -name")
+	}
+	if *pttKey != "" && !*audio {
+		log.Fatal("-ptt-key needs -audio")
+	}
 
-	room := "123"
-	id := "1"
-	name := "ferlin"
-	c, err := client.New(*signalURL, room, id, name)
+	var opts []client.Option
+	if *audio {
+		opts = append(opts, client.WithAudio())
+	}
+
+	// The key is grabbed before joining, so a key that is taken fails here
+	// instead of dropping the other peer mid-handshake.
+	var joined atomic.Pointer[client.Client]
+	if *pttKey != "" {
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		err := hotkey.Listen(ctx, *pttKey, func(talking bool) {
+			if c := joined.Load(); c != nil {
+				if err := c.SetTalking(talking); err != nil {
+					log.Printf("push-to-talk: %v", err)
+				}
+			}
+		})
+		if err != nil {
+			log.Fatal(err)
+		}
+		opts = append(opts, client.WithVoiceMode(client.VoicePushToTalk))
+		log.Printf("push-to-talk: hold %s to talk", *pttKey)
+	}
+
+	c, err := client.New(*signalURL, *room, *id, *name, opts...)
 	if err != nil {
 		log.Fatal(err)
 	}
 	defer c.Close()
+	joined.Store(c)
 
-	//c.CreateAudioTrack()
+	log.Printf("joined room %q, waiting for the other peer", *room)
 
-	<-stop
+	stop := make(chan os.Signal, 1)
+	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
+
+	msgChan := readInput()
+
+	// Closed when stdin runs out, which is one of the two ways the program ends.
+	inputDone := make(chan struct{})
+
+	go func() {
+		defer close(inputDone)
+
+		for msg := range msgChan {
+			rawMsg, err := json.Marshal(msg)
+			if err != nil {
+				log.Printf("encode message payload: %v", err)
+				continue
+			}
+
+			envelope := messages.Message{Type: messages.TypeString, Payload: rawMsg}
+			if err := c.SendMessage(envelope); err != nil {
+				log.Printf("send message: %v", err)
+			}
+		}
+	}()
+
+	c.ReceiveMessage(func(msg []byte) {
+		var envelope messages.Message
+		if err := json.Unmarshal(msg, &envelope); err != nil {
+			log.Printf("decode incoming message: %v", err)
+			return
+		}
+		showMessage(envelope)
+	})
+
+	select {
+	case <-stop:
+	case <-inputDone:
+	}
+
+	flush(c)
 }
 
 // flush waits for the data channel to drain so a message sent just before exit

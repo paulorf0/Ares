@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/paulorf0/Ares/messages"
 	_ "github.com/paulorf0/Ares/microphone"
+	"github.com/paulorf0/Ares/speaker"
 	"github.com/paulorf0/Ares/voice"
 	"github.com/pion/interceptor"
 	"github.com/pion/mediadevices"
@@ -26,6 +27,34 @@ const writeTimeout = 10 * time.Second
 var (
 	ErrNoWebSocketConnection = errors.New("client: no websocket connection")
 	ErrSignalingClosed       = errors.New("client: signaling connection closed")
+	ErrAudioDisabled         = errors.New("client: audio is off, create the client with WithAudio")
+)
+
+// Option configures a Client at creation.
+type Option func(*Client)
+
+// WithAudio turns on the voice call: the mic is captured and sent, and the
+// other peer's audio is played. It has to be decided up front, because a track
+// added after the handshake would never reach the other peer.
+func WithAudio() Option {
+	return func(c *Client) { c.audio = true }
+}
+
+// WithVoiceMode sets the voice mode from the start, so push-to-talk never
+// sends anything before the first SetTalking(true). Needs WithAudio.
+func WithVoiceMode(mode VoiceMode) Option {
+	return func(c *Client) { c.voiceMode = mode }
+}
+
+// VoiceMode says when the mic is sent.
+type VoiceMode int
+
+const (
+	// VoiceOpen sends the mic all the time.
+	VoiceOpen VoiceMode = iota
+	// VoicePushToTalk sends it only while SetTalking(true). Silent stretches
+	// cost no CPU: capture processing and encoding stop.
+	VoicePushToTalk
 )
 
 type Client struct {
@@ -42,13 +71,28 @@ type Client struct {
 	// Registered by the caller, invoked from a pion callback goroutine.
 	handlerMu sync.Mutex
 	onMessage func(msg []byte)
-	onAudio   func(frame []byte)
 
-	// Microphone capture and the codecs it was set up with; the same selector
-	// populates the MediaEngine so the SDP only offers what can be encoded.
+	// Codecs offered in the SDP. Always set, so a peer without audio can still
+	// receive it.
 	codecAudio *mediadevices.CodecSelector
-	audioTrack *mediadevices.AudioTrack
-	processor  *voice.Processor
+
+	// Voice call, only with WithAudio.
+	audio       bool
+	audioTrack  *mediadevices.AudioTrack
+	audioSender *webrtc.RTPSender
+	processor   *voice.Processor
+
+	// Push-to-talk state. The track can only be swapped once the sender has
+	// started, which happens while the descriptions are set.
+	voiceMu        sync.Mutex
+	voiceMode      VoiceMode
+	talking        bool
+	transmitting   bool
+	sendersStarted bool
+
+	playerMu sync.Mutex
+	player   *speaker.Player
+	stopped  bool
 
 	polite bool
 	roomID string
@@ -61,30 +105,45 @@ type Client struct {
 	pendingICE []webrtc.ICECandidateInit
 }
 
-func New(signalURL, roomID string, id string, name string) (*Client, error) {
+// New joins the room and starts the handshake in the background.
+func New(signalURL, roomID string, id string, name string, opts ...Option) (*Client, error) {
 	c := &Client{
 		id:     id,
 		name:   name,
 		roomID: roomID,
 		closed: make(chan struct{}),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	if c.voiceMode != VoiceOpen && !c.audio {
+		return nil, ErrAudioDisabled
+	}
 
-	//if err := c.connect(signalURL, roomID); err != nil {
-	//	return nil, err
-	//}
-	if err := c.openMicrophone(); err != nil {
-		c.closeSignaling()
+	opusParams, err := opus.NewParams()
+	if err != nil {
+		return nil, fmt.Errorf("opus params: %w", err)
+	}
+	c.codecAudio = mediadevices.NewCodecSelector(mediadevices.WithAudioEncoders(&opusParams))
+
+	if err := c.connect(signalURL, roomID); err != nil {
 		return nil, err
 	}
 	if err := c.createPeer(); err != nil {
 		c.Close()
 		return nil, err
 	}
-	if err := c.addAudioTrack(); err != nil {
-		c.Close()
-		return nil, err
+	if c.audio {
+		if err := c.openMicrophone(); err != nil {
+			c.Close()
+			return nil, err
+		}
+		if err := c.addAudioTrack(); err != nil {
+			c.Close()
+			return nil, err
+		}
 	}
-	//go c.readPump()
+	go c.readPump()
 
 	return c, nil
 }
@@ -279,6 +338,7 @@ func (c *Client) handleRemoteDescription(desc webrtc.SessionDescription) error {
 	c.flushPendingICE()
 
 	if desc.Type != webrtc.SDPTypeOffer {
+		c.sendersReady()
 		return nil
 	}
 
@@ -289,6 +349,7 @@ func (c *Client) handleRemoteDescription(desc webrtc.SessionDescription) error {
 	if err := c.connRTC.SetLocalDescription(answer); err != nil {
 		return fmt.Errorf("set local description: %w", err)
 	}
+	c.sendersReady()
 
 	return c.sendEnvelope(messages.TypeSDP, answer)
 }
@@ -395,8 +456,8 @@ func (c *Client) DataChannel() *webrtc.DataChannel {
 	return c.channel
 }
 
-// Close releases the signaling connection, the peer connection and the
-// microphone.
+// Close releases the signaling connection, the peer connection, the mic and
+// the speaker.
 func (c *Client) Close() error {
 	c.closeSignaling()
 
@@ -407,7 +468,15 @@ func (c *Client) Close() error {
 	if c.audioTrack != nil {
 		err = errors.Join(err, c.audioTrack.Close())
 	}
-	// After the track, so no frame reaches a closed processor.
+
+	c.playerMu.Lock()
+	c.stopped = true
+	if c.player != nil {
+		c.player.Close()
+	}
+	c.playerMu.Unlock()
+
+	// Last, so neither side of the audio reaches a closed processor.
 	if c.processor != nil {
 		c.processor.Close()
 	}
@@ -451,24 +520,9 @@ func (c *Client) ReceiveMessage(fn func(msg []byte)) {
 	c.onMessage = fn
 }
 
-// ReceiveAudio registers fn as the handler for incoming audio. Each call carries
-// one Opus packet taken from the remote track's RTP payload; frames that arrive
-// with no handler set are dropped.
-func (c *Client) ReceiveAudio(fn func(frame []byte)) {
-	c.handlerMu.Lock()
-	defer c.handlerMu.Unlock()
-	c.onAudio = fn
-}
-
 // openMicrophone opens the mic and sets up cleanup and Opus. The capture itself
 // only starts once the track is bound to the connection.
 func (c *Client) openMicrophone() error {
-	opusParams, err := opus.NewParams()
-	if err != nil {
-		return fmt.Errorf("opus params: %w", err)
-	}
-	codecSelector := mediadevices.NewCodecSelector(mediadevices.WithAudioEncoders(&opusParams))
-
 	stream, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
 		// Mono int16 is what the voice processor takes.
 		Audio: func(constraints *mediadevices.MediaTrackConstraints) {
@@ -477,7 +531,7 @@ func (c *Client) openMicrophone() error {
 			constraints.SampleSize = prop.IntExact(2)
 			constraints.IsFloat = prop.BoolExact(false)
 		},
-		Codec: codecSelector,
+		Codec: c.codecAudio,
 	})
 	if err != nil {
 		return fmt.Errorf("get user media: %w", err)
@@ -500,7 +554,6 @@ func (c *Client) openMicrophone() error {
 	}
 	audioTrack.Transform(processor.CaptureTransform())
 
-	c.codecAudio = codecSelector
 	c.audioTrack = audioTrack
 	c.processor = processor
 	return nil
@@ -518,6 +571,8 @@ func (c *Client) addAudioTrack() error {
 	if err != nil {
 		return fmt.Errorf("add audio track: %w", err)
 	}
+	c.audioSender = sender
+	c.transmitting = true
 
 	// RTCP feedback for the sender is only processed while something reads it.
 	go func() {
@@ -532,9 +587,18 @@ func (c *Client) addAudioTrack() error {
 	return nil
 }
 
-// readRemoteAudio hands each RTP payload of the remote track to the audio
-// handler until the track ends.
+// readRemoteAudio plays the other peer's audio until the track ends. Without
+// WithAudio the packets are just drained.
 func (c *Client) readRemoteAudio(track *webrtc.TrackRemote) {
+	var stream *speaker.Stream
+	if c.audio {
+		s, err := c.startPlayback()
+		if err != nil {
+			slog.Error("start playback", "error", err)
+		}
+		stream = s
+	}
+
 	for {
 		pkt, _, err := track.ReadRTP()
 		if err != nil {
@@ -543,13 +607,91 @@ func (c *Client) readRemoteAudio(track *webrtc.TrackRemote) {
 			}
 			return
 		}
-
-		c.handlerMu.Lock()
-		fn := c.onAudio
-		c.handlerMu.Unlock()
-
-		if fn != nil {
-			fn(pkt.Payload)
+		if stream != nil {
+			stream.Push(pkt)
 		}
 	}
+}
+
+// startPlayback opens the speaker. Every played frame goes through the voice
+// processor too, which is how the echo gets removed from the mic.
+func (c *Client) startPlayback() (*speaker.Stream, error) {
+	stream, err := speaker.NewStream()
+	if err != nil {
+		return nil, err
+	}
+	player, err := speaker.NewPlayer(stream, func(frame []int16) {
+		_ = c.processor.Render(frame)
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	c.playerMu.Lock()
+	defer c.playerMu.Unlock()
+	if c.stopped {
+		player.Close()
+		return nil, errors.New("client closed")
+	}
+	c.player = player
+	return stream, nil
+}
+
+// SetVoiceMode switches between an open mic and push-to-talk. Push-to-talk
+// starts silent until SetTalking(true).
+func (c *Client) SetVoiceMode(mode VoiceMode) error {
+	if !c.audio {
+		return ErrAudioDisabled
+	}
+	c.voiceMu.Lock()
+	defer c.voiceMu.Unlock()
+	c.voiceMode = mode
+	return c.applyVoice()
+}
+
+// SetTalking opens or closes the mic in push-to-talk. With an open mic it only
+// records the flag.
+func (c *Client) SetTalking(talking bool) error {
+	if !c.audio {
+		return ErrAudioDisabled
+	}
+	c.voiceMu.Lock()
+	defer c.voiceMu.Unlock()
+	c.talking = talking
+	return c.applyVoice()
+}
+
+// sendersReady runs once the descriptions have started the RTP senders; from
+// then on the mic track can be swapped out.
+func (c *Client) sendersReady() {
+	if c.audioSender == nil {
+		return
+	}
+	c.voiceMu.Lock()
+	defer c.voiceMu.Unlock()
+	c.sendersStarted = true
+	if err := c.applyVoice(); err != nil {
+		slog.Error("apply voice mode", "error", err)
+	}
+}
+
+// applyVoice sends or stops the mic to match the current mode. Removing the
+// track stops the encoder and the capture processing, not just the sending.
+// Before the senders start, pion refuses a missing track, so it waits; nothing
+// goes out before then anyway. Callers hold voiceMu.
+func (c *Client) applyVoice() error {
+	want := c.voiceMode == VoiceOpen || c.talking
+	if !c.sendersStarted || want == c.transmitting {
+		return nil
+	}
+
+	var track webrtc.TrackLocal
+	if want {
+		track = c.audioTrack
+	}
+	if err := c.audioSender.ReplaceTrack(track); err != nil {
+		return fmt.Errorf("switch mic: %w", err)
+	}
+	c.transmitting = want
+	return nil
 }

@@ -35,5 +35,9 @@ CLAUDE.md
 # Compiled binaries at the repo root.
 /ares
 /ares.exe
+/signal
+/signal.exe
 
 .idea
+# Built by the Makefile.
+/bin/

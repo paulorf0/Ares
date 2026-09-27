@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -101,5 +102,16 @@ func TestThirdPeerIsRejectedBeforeGettingARole(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "role") {
 		t.Errorf("error = %v, want it to point at the role message", err)
+	}
+}
+
+func TestVoiceControlsNeedAudio(t *testing.T) {
+	c := newClient(t, newSignalingServer(t, 0), "no-audio")
+
+	if err := c.SetVoiceMode(client.VoicePushToTalk); !errors.Is(err, client.ErrAudioDisabled) {
+		t.Errorf("SetVoiceMode without audio: %v, want ErrAudioDisabled", err)
+	}
+	if err := c.SetTalking(true); !errors.Is(err, client.ErrAudioDisabled) {
+		t.Errorf("SetTalking without audio: %v, want ErrAudioDisabled", err)
 	}
 }

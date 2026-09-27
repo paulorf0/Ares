@@ -8,7 +8,6 @@
 package microphone
 
 import (
-	"context"
 	"encoding/binary"
 	"errors"
 	"io"
@@ -27,6 +26,8 @@ const (
 	// Opus only runs at 48 kHz; asking for it avoids resampling in the encoder.
 	sampleRate = 48000
 	latency    = 20 * time.Millisecond
+	// Chunks kept while the reader lags, about 80 ms.
+	chunkBuffer = 4
 )
 
 var errUnsupportedFormat = errors.New("microphone: unsupported sample format")
@@ -91,7 +92,7 @@ type microphone struct {
 }
 
 func (m *microphone) Open() error {
-	m.chunks = make(chan []byte, 1)
+	m.chunks = make(chan []byte, chunkBuffer)
 	return nil
 }
 
@@ -158,29 +159,37 @@ func (m *microphone) AudioRecord(p prop.Media) (audio.Reader, error) {
 	config.SampleRate = uint32(p.SampleRate)
 	config.PeriodSizeInMilliseconds = uint32(p.Latency.Milliseconds())
 
-	cancelCtx, cancel := context.WithCancel(context.Background())
 	chunks := m.chunks
 
 	callbacks := malgo.DeviceCallbacks{
 		// The input slice points at miniaudio's buffer, which is reused after
 		// the callback returns, so it has to be copied before leaving.
+		// Never blocks the audio thread: when nobody reads (mic muted), the
+		// oldest chunk goes, so unmuting starts with fresh audio.
 		Data: func(_, input []byte, _ uint32) {
 			chunk := make([]byte, len(input))
 			copy(chunk, input)
 			select {
-			case <-cancelCtx.Done():
 			case chunks <- chunk:
+				return
+			default:
+			}
+			select {
+			case <-chunks:
+			default:
+			}
+			select {
+			case chunks <- chunk:
+			default:
 			}
 		},
 	}
 
 	device, err := malgo.InitDevice(malgoCtx.Context, config, callbacks)
 	if err != nil {
-		cancel()
 		return nil, err
 	}
 	if err := device.Start(); err != nil {
-		cancel()
 		device.Uninit()
 		return nil, err
 	}
@@ -188,8 +197,6 @@ func (m *microphone) AudioRecord(p prop.Media) (audio.Reader, error) {
 	var once sync.Once
 	m.closeFunc = func() {
 		once.Do(func() {
-			// Cancel first so a blocked callback returns and Uninit can finish.
-			cancel()
 			device.Uninit()
 			close(chunks)
 		})

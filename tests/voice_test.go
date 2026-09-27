@@ -109,3 +109,81 @@ func TestVoicePassesAudioThroughAfterClose(t *testing.T) {
 		t.Errorf("audio after Close is %.1f dBFS, looks silenced", got)
 	}
 }
+
+// speechLike yields fixed-seed noise in bursts of about a syllable, which noise
+// suppression keeps (unlike steady noise) so only echo cancellation removes it.
+func speechLike(total int) []int16 {
+	rng := rand.New(rand.NewPCG(3, 4))
+	out := make([]int16, total)
+	for i := range out {
+		if (i/9600)%3 == 2 { // 400 ms on, 200 ms off
+			continue
+		}
+		out[i] = int16(rng.IntN(12000) - 6000)
+	}
+	return out
+}
+
+// echoLevel runs the echo of far through a processor and returns the level of
+// what it sends in the last second. With render set, the processor also sees
+// far as it is played.
+func echoLevel(t *testing.T, far []int16, render bool) float64 {
+	t.Helper()
+	p := newProcessor(t)
+
+	const delay = 960 // the speaker is heard by the mic 20 ms later, at half volume
+	frames := len(far) / voice.FrameSamples
+	i := 0
+	capture := audio.ReaderFunc(func() (wave.Audio, func(), error) {
+		if i == frames {
+			return nil, func() {}, io.EOF
+		}
+		start := i * voice.FrameSamples
+		if render {
+			played := append([]int16(nil), far[start:start+voice.FrameSamples]...)
+			if err := p.Render(played); err != nil {
+				t.Fatal(err)
+			}
+		}
+		chunk := wave.NewInt16Interleaved(wave.ChunkInfo{Len: voice.FrameSamples, Channels: 1, SamplingRate: 48000})
+		for j := range chunk.Data {
+			if k := start + j - delay; k >= 0 {
+				chunk.Data[j] = far[k] / 2
+			}
+		}
+		i++
+		return chunk, func() {}, nil
+	})
+
+	r := p.CaptureTransform()(capture)
+	var sent []int16
+	for {
+		chunk, _, err := r.Read()
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			t.Fatal(err)
+		}
+		sent = append(sent, chunk.(*wave.Int16Interleaved).Data...)
+	}
+	return levelDB(sent[len(sent)-48000:])
+}
+
+func TestVoiceCancelsSpeakerEcho(t *testing.T) {
+	far := speechLike(48000 * 6)
+
+	without := echoLevel(t, far, false)
+	with := echoLevel(t, far, true)
+	t.Logf("echo sent: %.1f dBFS without the speaker signal, %.1f with it", without, with)
+
+	if with > without-10 {
+		t.Errorf("seeing the speaker signal only cut the echo from %.1f to %.1f dBFS, want 10 dB less", without, with)
+	}
+}
+
+func TestVoiceRenderTakesTenMillisecondFrames(t *testing.T) {
+	if err := newProcessor(t).Render(make([]int16, 100)); err == nil {
+		t.Error("Render accepted a frame that is not 10 ms")
+	}
+}
