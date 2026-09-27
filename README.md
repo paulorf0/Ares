@@ -70,13 +70,6 @@ CGO_ENABLED=1 CC=x86_64-w64-mingw32-gcc CXX=x86_64-w64-mingw32-g++ \
   GOOS=windows GOARCH=amd64 go build -o ares.exe ./cmd/ares
 ```
 
-To check that your microphone is captured correctly, record five seconds to an
-Ogg file and listen to it:
-
-```bash
-ARES_MIC_TEST=1 go test -run TestMicrophoneRecordsToOgg -v ./tests/
-```
-
 ## Known limitations
 
 - **No TURN server.** Connections behind CGNAT or symmetric NAT on both ends

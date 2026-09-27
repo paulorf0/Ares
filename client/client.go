@@ -13,6 +13,7 @@ import (
 	"github.com/gorilla/websocket"
 	"github.com/paulorf0/Ares/messages"
 	_ "github.com/paulorf0/Ares/microphone"
+	"github.com/paulorf0/Ares/voice"
 	"github.com/pion/interceptor"
 	"github.com/pion/mediadevices"
 	"github.com/pion/mediadevices/pkg/codec/opus"
@@ -47,6 +48,7 @@ type Client struct {
 	// populates the MediaEngine so the SDP only offers what can be encoded.
 	codecAudio *mediadevices.CodecSelector
 	audioTrack *mediadevices.AudioTrack
+	processor  *voice.Processor
 
 	polite bool
 	roomID string
@@ -70,7 +72,7 @@ func New(signalURL, roomID string, id string, name string) (*Client, error) {
 	//if err := c.connect(signalURL, roomID); err != nil {
 	//	return nil, err
 	//}
-	if err := c.captureAudio(); err != nil {
+	if err := c.openMicrophone(); err != nil {
 		c.closeSignaling()
 		return nil, err
 	}
@@ -405,6 +407,10 @@ func (c *Client) Close() error {
 	if c.audioTrack != nil {
 		err = errors.Join(err, c.audioTrack.Close())
 	}
+	// After the track, so no frame reaches a closed processor.
+	if c.processor != nil {
+		c.processor.Close()
+	}
 	return err
 }
 
@@ -454,8 +460,9 @@ func (c *Client) ReceiveAudio(fn func(frame []byte)) {
 	c.onAudio = fn
 }
 
-// captureAudio opens the microphone with an Opus encoder attached.
-func (c *Client) captureAudio() error {
+// openMicrophone opens the mic and sets up cleanup and Opus. The capture itself
+// only starts once the track is bound to the connection.
+func (c *Client) openMicrophone() error {
 	opusParams, err := opus.NewParams()
 	if err != nil {
 		return fmt.Errorf("opus params: %w", err)
@@ -463,9 +470,12 @@ func (c *Client) captureAudio() error {
 	codecSelector := mediadevices.NewCodecSelector(mediadevices.WithAudioEncoders(&opusParams))
 
 	stream, err := mediadevices.GetUserMedia(mediadevices.MediaStreamConstraints{
+		// Mono int16 is what the voice processor takes.
 		Audio: func(constraints *mediadevices.MediaTrackConstraints) {
 			constraints.SampleRate = prop.Int(48000)
-			constraints.ChannelCount = prop.Int(2)
+			constraints.ChannelCount = prop.IntExact(1)
+			constraints.SampleSize = prop.IntExact(2)
+			constraints.IsFloat = prop.BoolExact(false)
 		},
 		Codec: codecSelector,
 	})
@@ -483,8 +493,16 @@ func (c *Client) captureAudio() error {
 		return fmt.Errorf("get user media: unexpected track type %T", tracks[0])
 	}
 
+	processor, err := voice.New()
+	if err != nil {
+		audioTrack.Close()
+		return fmt.Errorf("voice processor: %w", err)
+	}
+	audioTrack.Transform(processor.CaptureTransform())
+
 	c.codecAudio = codecSelector
 	c.audioTrack = audioTrack
+	c.processor = processor
 	return nil
 }
 

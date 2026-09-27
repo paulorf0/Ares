@@ -35,3 +35,5 @@ CLAUDE.md
 # Compiled binaries at the repo root.
 /ares
 /ares.exe
+
+.idea
