@@ -12,7 +12,7 @@ import (
 
 	"github.com/gorilla/websocket"
 	"github.com/paulorf0/Ares/messages"
-	_ "github.com/paulorf0/Ares/microphone"
+	"github.com/paulorf0/Ares/microphone"
 	"github.com/paulorf0/Ares/speaker"
 	"github.com/paulorf0/Ares/voice"
 	"github.com/pion/interceptor"
@@ -28,6 +28,7 @@ var (
 	ErrNoWebSocketConnection = errors.New("client: no websocket connection")
 	ErrSignalingClosed       = errors.New("client: signaling connection closed")
 	ErrAudioDisabled         = errors.New("client: audio is off, create the client with WithAudio")
+	ErrNotConnected          = errors.New("client: not connected to the other peer")
 )
 
 // Option configures a Client at creation.
@@ -90,8 +91,15 @@ type Client struct {
 	transmitting   bool
 	sendersStarted bool
 
+	// Mic chunks dropped while sending: the count at the last time sending
+	// started, and what was lost in earlier stretches.
+	micDropBase uint64
+	micDropSent uint64
+	ended       bool
+
 	playerMu sync.Mutex
 	player   *speaker.Player
+	stream   *speaker.Stream
 	stopped  bool
 
 	polite bool
@@ -237,6 +245,9 @@ func (c *Client) createPeer() error {
 
 	conn.OnConnectionStateChange(func(state webrtc.PeerConnectionState) {
 		slog.Info("peer connection state changed", "state", state.String())
+		if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
+			c.endCall()
+		}
 	})
 
 	return nil
@@ -436,6 +447,23 @@ func (c *Client) ConnectionState() webrtc.PeerConnectionState {
 	return c.connRTC.ConnectionState()
 }
 
+// Ping returns the round-trip time to the other peer. ICE keeps checking the
+// path in use every few seconds, so this is the latest of those measurements,
+// with no extra traffic. It fails with ErrNotConnected until a path exists.
+func (c *Client) Ping() (time.Duration, error) {
+	// A closed transport logs an error when asked, so don't ask.
+	switch c.connRTC.ConnectionState() {
+	case webrtc.PeerConnectionStateClosed, webrtc.PeerConnectionStateFailed:
+		return 0, ErrNotConnected
+	}
+	ice := c.connRTC.SCTP().Transport().ICETransport()
+	stats, ok := ice.GetSelectedCandidatePairStats()
+	if !ok || stats.ResponsesReceived == 0 {
+		return 0, ErrNotConnected
+	}
+	return time.Duration(stats.CurrentRoundTripTime * float64(time.Second)), nil
+}
+
 // SignalingClosed reports whether the signaling connection has been torn down.
 // It closes on its own once the data channel opens.
 func (c *Client) SignalingClosed() bool {
@@ -608,7 +636,7 @@ func (c *Client) readRemoteAudio(track *webrtc.TrackRemote) {
 			return
 		}
 		if stream != nil {
-			stream.Push(pkt)
+			stream.Push(pkt, time.Now())
 		}
 	}
 }
@@ -634,6 +662,7 @@ func (c *Client) startPlayback() (*speaker.Stream, error) {
 		return nil, errors.New("client closed")
 	}
 	c.player = player
+	c.stream = stream
 	return stream, nil
 }
 
@@ -670,6 +699,7 @@ func (c *Client) sendersReady() {
 	c.voiceMu.Lock()
 	defer c.voiceMu.Unlock()
 	c.sendersStarted = true
+	c.micDropBase = microphone.DroppedChunks()
 	if err := c.applyVoice(); err != nil {
 		slog.Error("apply voice mode", "error", err)
 	}
@@ -681,7 +711,7 @@ func (c *Client) sendersReady() {
 // goes out before then anyway. Callers hold voiceMu.
 func (c *Client) applyVoice() error {
 	want := c.voiceMode == VoiceOpen || c.talking
-	if !c.sendersStarted || want == c.transmitting {
+	if !c.sendersStarted || c.ended || want == c.transmitting {
 		return nil
 	}
 
@@ -692,6 +722,69 @@ func (c *Client) applyVoice() error {
 	if err := c.audioSender.ReplaceTrack(track); err != nil {
 		return fmt.Errorf("switch mic: %w", err)
 	}
+	if want {
+		c.micDropBase = microphone.DroppedChunks()
+	} else {
+		c.micDropSent += microphone.DroppedChunks() - c.micDropBase
+	}
 	c.transmitting = want
 	return nil
+}
+
+// endCall freezes the sending numbers once the connection is gone. The mic is
+// no longer read from then on, so its dropped chunks mean nothing.
+func (c *Client) endCall() {
+	c.voiceMu.Lock()
+	defer c.voiceMu.Unlock()
+	if c.ended {
+		return
+	}
+	if c.sendersStarted && c.transmitting {
+		c.micDropSent += microphone.DroppedChunks() - c.micDropBase
+	}
+	c.transmitting = false
+	c.ended = true
+}
+
+// Stats is a snapshot of how the call is doing.
+type Stats struct {
+	// Ended reports that the connection closed or failed; the other numbers
+	// are then final.
+	Ended bool
+	// RTT is the round trip to the other peer, zero until measured.
+	RTT time.Duration
+	// Audio reports whether the client was created WithAudio.
+	Audio bool
+	// Receiving describes the other peer's audio, nil while none comes in.
+	Receiving *speaker.Stats
+	// Transmitting reports whether the mic is being sent right now.
+	Transmitting bool
+	// MicDropped counts mic chunks lost while sending; each is a gap the
+	// other peer hears.
+	MicDropped uint64
+}
+
+// Stats reports the connection and the audio in both directions.
+func (c *Client) Stats() Stats {
+	stats := Stats{Audio: c.audio}
+	stats.RTT, _ = c.Ping()
+
+	c.playerMu.Lock()
+	if c.stream != nil {
+		received := c.stream.Stats()
+		stats.Receiving = &received
+	}
+	c.playerMu.Unlock()
+
+	c.voiceMu.Lock()
+	defer c.voiceMu.Unlock()
+	stats.Ended = c.ended
+	if c.sendersStarted {
+		stats.Transmitting = c.transmitting
+		stats.MicDropped = c.micDropSent
+		if c.transmitting {
+			stats.MicDropped += microphone.DroppedChunks() - c.micDropBase
+		}
+	}
+	return stats
 }

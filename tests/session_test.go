@@ -115,3 +115,53 @@ func TestVoiceControlsNeedAudio(t *testing.T) {
 		t.Errorf("SetTalking without audio: %v, want ErrAudioDisabled", err)
 	}
 }
+
+func TestPingFailsBeforeThePeerConnects(t *testing.T) {
+	c := newClient(t, newSignalingServer(t, 0), "ping-alone")
+
+	if _, err := c.Ping(); !errors.Is(err, client.ErrNotConnected) {
+		t.Errorf("Ping with no peer: %v, want ErrNotConnected", err)
+	}
+}
+
+func TestPingMeasuresTheConnection(t *testing.T) {
+	a, b := connectedPair(t, "ping")
+
+	for _, c := range []*client.Client{a, b} {
+		var rtt time.Duration
+		waitFor(t, "a round-trip measurement", func() bool {
+			var err error
+			rtt, err = c.Ping()
+			return err == nil
+		})
+		// Both peers share this machine, so anything near a second is wrong.
+		if rtt <= 0 || rtt > time.Second {
+			t.Errorf("Ping = %v, want a small positive round trip", rtt)
+		}
+	}
+}
+
+func TestStatsWithoutAudio(t *testing.T) {
+	a, _ := connectedPair(t, "stats")
+
+	waitFor(t, "a round-trip measurement", func() bool { return a.Stats().RTT > 0 })
+	stats := a.Stats()
+	if stats.Audio || stats.Receiving != nil || stats.Transmitting || stats.MicDropped != 0 {
+		t.Errorf("text-only call reports audio: %+v", stats)
+	}
+}
+
+func TestStatsReportTheEndOfTheCall(t *testing.T) {
+	a, b := connectedPair(t, "ending")
+	waitFor(t, "a round-trip measurement", func() bool { return a.Stats().RTT > 0 })
+
+	b.Close()
+	waitFor(t, "the call to end on the other side", func() bool { return a.Stats().Ended })
+
+	if _, err := a.Ping(); !errors.Is(err, client.ErrNotConnected) {
+		t.Errorf("Ping after the call ended: %v, want ErrNotConnected", err)
+	}
+	if stats := b.Stats(); !stats.Ended || stats.RTT != 0 {
+		t.Errorf("stats of the closed side: %+v, want ended with no RTT", stats)
+	}
+}

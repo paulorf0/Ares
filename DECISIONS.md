@@ -203,10 +203,29 @@ the render side, on the audio thread.
 
 Received audio is decoded with `github.com/pion/opus` v0.1.0 (pure Go, SILK,
 CELT and hybrid, int16 at 48 kHz) and played through malgo, in a `speaker/`
-package that mirrors `microphone/`. Packets are put back in order by a small
-buffer of its own (a 2-packet wait, 80 ms prebuffer, 200 ms cap against clock
-drift). pion's `samplebuilder` was dropped: it holds each packet until the
-next one arrives, which cut word endings before every push-to-talk pause.
+package that mirrors `microphone/`.
+
+The jitter buffer is adaptive, in the spirit of WebRTC's NetEQ:
+- packets are stored and only decoded when their turn to play comes, so a late
+  packet still plays if it beats its turn; one that never does plays as silence;
+- the target delay is the recent spread of arrival delays (97th percentile of
+  the last ~2 s) plus 20 ms, between 40 and 300 ms. It rises at once and falls
+  at 20 ms/s at most;
+- the level is steered through silence only: silent 10 ms frames are skipped
+  when the buffer holds more than target plus max(40 ms, jitter), and played
+  twice when it holds less than the target, at most once per packet received
+  (a stream that stopped must not stretch forever). Speech is only cut past
+  500 ms.
+
+`/stats` stops at the end of the call with a final report. Mic drops only
+count when the reader was late and came back; a reader that stopped (muted,
+call over) leaves drops that are expected.
+
+pion's `samplebuilder` was dropped: it holds each packet until the next one
+arrives, which cut word endings before every push-to-talk pause. Loss and
+jitter are measured by the buffer itself rather than read from pion's stats,
+because pion counts by sequence number, and push-to-talk restarts it at random
+on every talk spurt. `/stats` in the terminal shows these numbers.
 
 Audio is turned on with `client.New(..., WithAudio())`. It has to be decided
 before the first offer: with no renegotiation yet (D6), a track added later
@@ -254,7 +273,7 @@ so the suggested default is `ctrl+shift+f9`.
 
 | # | Decision | When to decide |
 |---|----------|----------------|
-| A1 | Interface: TUI (bubbletea) or plain CLI | Before phase 1 becomes usable |
+| A1 | Interface: a graphical UI is planned (which toolkit is open). The terminal client mixes incoming messages into the line being typed | Before calls are shared beyond testing |
 | A4 | Local message history (SQLite / file / none) | Late phase 1 |
 | A5 | Database and persistent identity (see D2) | After phase 1 |
 | A6 | Reconnection strategy (ICE Restart) | Once dropouts become annoying |
@@ -286,8 +305,10 @@ contradicts the project's premise.
 - ~~Opus decoding and playback~~ (done, D14).
 - ~~Audio opt-in with `WithAudio`~~ (done, D14).
 - ~~Open mic or push-to-talk~~ (done, D15).
-- A voice call tested between two machines on different networks.
+- ~~A voice call between two machines~~ (Linux and Windows, through ngrok).
+- ~~Adaptive jitter buffer and `/stats`~~ (done, D14).
 - Packet loss concealment once `pion/opus` releases `DecodePLC`.
+- Opus in-band FEC and DTX, if `/stats` shows frequent real loss.
 - Renegotiation over the DataChannel (D6), so a call can start after the
   connection is up.
 - Decision point for revisiting D1 (capture and encoding in Go).

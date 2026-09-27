@@ -55,6 +55,8 @@ func main() {
 	id := flag.String("id", "", "client id")
 	name := flag.String("name", "", "client name")
 	audio := flag.Bool("audio", false, "join with voice: send the mic and play the other peer")
+	statsEvery := flag.Duration("stats", 0,
+		"print connection stats this often, like 5s (0 = only on /stats)")
 	pttKey := flag.String("ptt-key", "",
 		"push-to-talk key, like ctrl+shift+f9; talk only while it is held (needs -audio)")
 	flag.Parse()
@@ -106,6 +108,17 @@ func main() {
 
 	log.Printf("joined room %q, waiting for the other peer", *room)
 
+	if *statsEvery > 0 {
+		go func() {
+			for range time.Tick(*statsEvery) {
+				// The last report after the call ends is the final one.
+				if !showStats(c) {
+					return
+				}
+			}
+		}()
+	}
+
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, os.Interrupt, syscall.SIGTERM)
 
@@ -118,6 +131,15 @@ func main() {
 		defer close(inputDone)
 
 		for msg := range msgChan {
+			switch msg {
+			case "/ping":
+				showPing(c)
+				continue
+			case "/stats":
+				showStats(c)
+				continue
+			}
+
 			rawMsg, err := json.Marshal(msg)
 			if err != nil {
 				log.Printf("encode message payload: %v", err)
@@ -146,6 +168,58 @@ func main() {
 	}
 
 	flush(c)
+}
+
+// showPing prints the round trip to the other peer. It is local: nothing is
+// sent.
+func showPing(c *client.Client) {
+	rtt, err := c.Ping()
+	if err != nil {
+		fmt.Println("ping:", err)
+		return
+	}
+	fmt.Printf("ping: %.1f ms\n", float64(rtt.Microseconds())/1000)
+}
+
+// showStats prints how the call is doing, for debugging a bad connection.
+// Like /ping, it is local. It reports false once the call has ended.
+func showStats(c *client.Client) bool {
+	stats := c.Stats()
+	ms := func(d time.Duration) string { return fmt.Sprintf("%.0f ms", float64(d.Microseconds())/1000) }
+
+	switch {
+	case stats.Ended:
+		fmt.Println("call ended, final numbers:")
+	case stats.RTT > 0:
+		fmt.Printf("rtt %.1f ms\n", float64(stats.RTT.Microseconds())/1000)
+	default:
+		fmt.Println("rtt: not connected yet")
+	}
+
+	if r := stats.Receiving; r != nil {
+		lossPct := 0.0
+		if total := r.Received + r.Lost; total > 0 {
+			lossPct = 100 * float64(r.Lost) / float64(total)
+		}
+		fmt.Printf("receiving: jitter %s, delay %s (target %s), lost %d (%.1f%%), late %d, ran dry %dx\n",
+			ms(r.Jitter), ms(r.Buffered), ms(r.Target), r.Lost, lossPct, r.Late, r.Underruns)
+		fmt.Printf("           silence trimmed %s, added %s, speech cut %s\n",
+			ms(r.SilenceTrimmed), ms(r.SilenceAdded), ms(r.SpeechCut))
+	} else {
+		fmt.Println("receiving: no audio")
+	}
+
+	switch {
+	case !stats.Audio:
+		fmt.Println("sending: no audio")
+	case stats.Ended:
+		fmt.Printf("sending: mic dropped %d chunks\n", stats.MicDropped)
+	case stats.Transmitting:
+		fmt.Printf("sending: on, mic dropped %d chunks\n", stats.MicDropped)
+	default:
+		fmt.Printf("sending: muted, mic dropped %d chunks\n", stats.MicDropped)
+	}
+	return !stats.Ended
 }
 
 // flush waits for the data channel to drain so a message sent just before exit

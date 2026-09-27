@@ -19,12 +19,12 @@ sits idle or stays off entirely.
 Voice calls work: the microphone is cleaned up (noise suppression, automatic
 gain, echo cancellation), encoded with Opus and sent, and the other peer's
 audio is played. The mic can stay open or work as push-to-talk with a global
-key. So far calls have only been tried between two clients on the same
-machine. Video and screen sharing have not started.
+key. A call between Linux and Windows through an ngrok tunnel has worked.
+Video and screen sharing have not started.
 
 Not there yet: room codes are typed by hand rather than generated, the interface
-is a bare terminal, and nothing has been tested across two real networks, so NAT
-traversal is still unproven.
+is a bare terminal (a graphical one is planned), and connections across
+restrictive NATs are unproven.
 
 This is a learning project: the goal is to understand the WebRTC protocol from
 the ground up, which is why it uses pion directly rather than embedding a
@@ -53,7 +53,15 @@ go run ./cmd/ares -room ABC123 -id 1 -name Alice
 go run ./cmd/ares -room ABC123 -id 2 -name Bob
 ```
 
-Type a line and press Enter to send it. Ctrl+C or Ctrl+D quits.
+Type a line and press Enter to send it. Ctrl+C or Ctrl+D quits. Two local
+commands help when a call sounds bad; neither sends anything:
+
+- `/ping` shows the round trip to the other peer;
+- `/stats` adds the received audio (jitter, delay, lost and late packets, how
+  often playback ran dry) and whether your mic lost audio while sending.
+
+`-stats 5s` prints the same every 5 seconds, handy since typing while messages
+arrive garbles the line.
 
 Add `-audio` to talk as well. The mic stays open by default; with `-ptt-key`
 it only sends while the key is held, even with the terminal in the background:

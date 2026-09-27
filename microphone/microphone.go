@@ -13,6 +13,7 @@ import (
 	"io"
 	"log/slog"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/gen2brain/malgo"
@@ -31,6 +32,34 @@ const (
 )
 
 var errUnsupportedFormat = errors.New("microphone: unsupported sample format")
+
+// A reader that falls behind loses chunks and then catches up; one that
+// stopped (muted, or the call ended) never comes back. Drops are held as
+// pending and only count once the reader returns within resumeWindow.
+var (
+	dropped  atomic.Uint64
+	pending  atomic.Uint64
+	lastRead atomic.Int64 // Unix nanoseconds
+)
+
+const resumeWindow = 300 * time.Millisecond
+
+// DroppedChunks counts the audio chunks lost because the reader fell behind.
+// Each one is a gap the other peer hears. Chunks dropped while nobody reads,
+// as while muted, don't count.
+func DroppedChunks() uint64 {
+	return dropped.Load()
+}
+
+// markRead settles the pending drops: real if the reader was only late,
+// expected if it had stopped.
+func markRead() {
+	now := time.Now().UnixNano()
+	gap := time.Duration(now - lastRead.Swap(now))
+	if n := pending.Swap(0); gap < resumeWindow {
+		dropped.Add(n)
+	}
+}
 
 var (
 	malgoCtx   *malgo.AllocatedContext
@@ -176,11 +205,13 @@ func (m *microphone) AudioRecord(p prop.Media) (audio.Reader, error) {
 			}
 			select {
 			case <-chunks:
+				pending.Add(1)
 			default:
 			}
 			select {
 			case chunks <- chunk:
 			default:
+				pending.Add(1)
 			}
 		},
 	}
@@ -204,6 +235,7 @@ func (m *microphone) AudioRecord(p prop.Media) (audio.Reader, error) {
 
 	reader := audio.ReaderFunc(func() (wave.Audio, func(), error) {
 		chunk, ok := <-chunks
+		markRead()
 		if !ok {
 			return nil, func() {}, io.EOF
 		}
