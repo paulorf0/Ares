@@ -9,6 +9,8 @@ import (
 	"log"
 	"os"
 	"os/signal"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -16,6 +18,7 @@ import (
 	"github.com/paulorf0/Ares/client"
 	"github.com/paulorf0/Ares/hotkey"
 	"github.com/paulorf0/Ares/messages"
+	"github.com/paulorf0/Ares/viewer"
 )
 
 // Messages in a session are all from today, so the date would only add noise.
@@ -59,6 +62,10 @@ func main() {
 		"print connection stats this often, like 5s (0 = only on /stats)")
 	pttKey := flag.String("ptt-key", "",
 		"push-to-talk key, like ctrl+shift+f9; talk only while it is held (needs -audio)")
+	showVideo := flag.Bool("video", false, "open a window with the other peer's video")
+	camera := flag.Bool("camera", false, "start with the camera on (toggle with /camera)")
+	quality := flag.String("quality", "high",
+		"camera quality: high/alta, medium/media, low/baixa or minimum/minima (change with /quality)")
 	flag.Parse()
 
 	if *room == "" {
@@ -74,7 +81,11 @@ func main() {
 		log.Fatal("-ptt-key needs -audio")
 	}
 
-	var opts []client.Option
+	level, err := client.ParseVideoQuality(*quality)
+	if err != nil {
+		log.Fatal(err)
+	}
+	opts := []client.Option{client.WithVideoQuality(level)}
 	if *audio {
 		opts = append(opts, client.WithAudio())
 	}
@@ -108,6 +119,33 @@ func main() {
 
 	log.Printf("joined room %q, waiting for the other peer", *room)
 
+	var window *viewer.Window
+	if *showVideo {
+		window = viewer.New("Ares - "+*room,
+			func() { toggleCamera(c) },
+			func(level int) { setQuality(c, client.VideoQuality(level)) })
+		c.OnRemoteVideo(window.Show)
+	}
+	c.OnRemoteCamera(func(on bool) {
+		log.Printf("the other peer turned the camera %s", onOff(on))
+		if window != nil {
+			window.SetRemoteCamera(on)
+		}
+	})
+	c.OnCameraStatus(func(sending bool, err error) {
+		switch {
+		case sending:
+			log.Printf("camera on")
+		case err != nil:
+			log.Printf("camera not available: %v; it will turn on by itself once free (/camera to cancel)", err)
+		default:
+			log.Printf("camera off")
+		}
+	})
+	if *camera {
+		toggleCamera(c)
+	}
+
 	if *statsEvery > 0 {
 		go func() {
 			for range time.Tick(*statsEvery) {
@@ -138,6 +176,13 @@ func main() {
 			case "/stats":
 				showStats(c)
 				continue
+			case "/camera":
+				toggleCamera(c)
+				continue
+			}
+			if name, ok := strings.CutPrefix(msg, "/quality"); ok && (name == "" || name[0] == ' ') {
+				qualityCommand(c, name)
+				continue
 			}
 
 			rawMsg, err := json.Marshal(msg)
@@ -162,12 +207,66 @@ func main() {
 		showMessage(envelope)
 	})
 
-	select {
-	case <-stop:
-	case <-inputDone:
+	// The program ends on a signal, at the end of stdin, or when the video
+	// window is closed.
+	quit := make(chan struct{})
+	var quitOnce sync.Once
+	exit := func() { quitOnce.Do(func() { close(quit) }) }
+	go func() {
+		select {
+		case <-stop:
+		case <-inputDone:
+		}
+		exit()
+	}()
+
+	if window != nil {
+		// The window needs the main goroutine.
+		if err := window.Run(quit); err != nil {
+			log.Printf("video window: %v", err)
+		}
+		exit()
 	}
+	<-quit
 
 	flush(c)
+}
+
+// toggleCamera turns the camera on if it is off and off if it is on. It
+// returns at once; OnCameraStatus reports what happens.
+func toggleCamera(c *client.Client) {
+	if err := c.SetCamera(!c.CameraOn()); err != nil {
+		log.Printf("camera: %v", err)
+	}
+}
+
+// qualityCommand handles /quality: with no level it shows the current one.
+func qualityCommand(c *client.Client, arg string) {
+	if strings.TrimSpace(arg) == "" {
+		fmt.Printf("camera quality: %s (high, medium, low, minimum)\n", c.VideoQuality())
+		return
+	}
+	level, err := client.ParseVideoQuality(arg)
+	if err != nil {
+		log.Printf("quality: %v", err)
+		return
+	}
+	setQuality(c, level)
+}
+
+func setQuality(c *client.Client, level client.VideoQuality) {
+	if err := c.SetVideoQuality(level); err != nil {
+		log.Printf("quality: %v", err)
+		return
+	}
+	log.Printf("camera quality %s", level)
+}
+
+func onOff(on bool) string {
+	if on {
+		return "on"
+	}
+	return "off"
 }
 
 // showPing prints the round trip to the other peer. It is local: nothing is
@@ -219,6 +318,7 @@ func showStats(c *client.Client) bool {
 	default:
 		fmt.Printf("sending: muted, mic dropped %d chunks\n", stats.MicDropped)
 	}
+	showVideoStats(stats.Video)
 	return !stats.Ended
 }
 
@@ -234,5 +334,24 @@ func flush(c *client.Client) {
 	deadline := time.Now().Add(flushTimeout)
 	for channel.BufferedAmount() > 0 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
+	}
+}
+
+func showVideoStats(v client.VideoStats) {
+	switch r := v.Receiving; {
+	case !v.RemoteCameraOn:
+		fmt.Println("video in: camera off")
+	case r == nil:
+		fmt.Println("video in: camera on, nothing received yet")
+	default:
+		fmt.Printf("video in: %dx%d, %.0f fps, %.0f kbps, %d frames, %d dropped, %d decode errors, %d key frames asked\n",
+			r.Width, r.Height, r.FrameRate, r.Bitrate/1000, r.Frames, r.Dropped, r.DecodeErrors, r.KeyFrameRequests)
+	}
+	if v.Sending {
+		fmt.Printf("video out: camera on, %s %dx%d, %d packets, %.1f MB sent\n",
+			v.Quality, v.Width, v.Height, v.Sent.Packets, float64(v.Sent.Bytes)/1e6)
+	} else {
+		fmt.Printf("video out: camera off (quality %s), %d packets, %.1f MB sent\n",
+			v.Quality, v.Sent.Packets, float64(v.Sent.Bytes)/1e6)
 	}
 }

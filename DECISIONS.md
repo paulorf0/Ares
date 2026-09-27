@@ -1,7 +1,7 @@
 # Architecture Decisions - Ares
 
 P2P chat over WebRTC. Open-source learning project.
-Last updated: 2026-09-12
+Last updated: 2026-09-27
 
 ---
 
@@ -30,7 +30,7 @@ hides the very layer we want to study.
 encoders. Audio already needs CGO: miniaudio for capture, libopus for encoding
 and the WebRTC APM for processing (D13), so every build needs a C/C++ compiler
 and cross-compiling needs a cross toolchain. Revisit specifically when reaching
-**video**.
+**video**. Revisited for video: D1 stays (D16).
 
 ### D2 - Identity: ephemeral room code
 
@@ -147,6 +147,11 @@ messages/     wire format shared by both
 microphone/   capture driver for mediadevices (D13)
 voice/        WebRTC APM: noise, gain, echo (D13)
 speaker/      reorders, decodes and plays received audio (D14)
+rtpstream/    keeps RTP numbering continuous across track swaps (D15)
+h264/         H.264 decoder over the bundled openh264 (D16)
+video/        reorders, decodes and hands out received video (D16)
+viewer/       video window, used only by cmd/ares (D17)
+framing/      downscales and paces camera frames to the quality level (D18)
 hotkey/       global push-to-talk key, used only by cmd/ares (D15)
 cmd/ares/     client binary
 cmd/signal/   server binary
@@ -249,6 +254,15 @@ Muting uses `RTPSender.ReplaceTrack(nil)`: the track is unbound, mediadevices
 stops its encoder goroutine, and the APM and Opus stop running. The mic device
 stays open, so talking again is instant.
 
+Every bind of a mediadevices track starts a packetizer with random sequence
+number and timestamp. The receiver's SRTP expects the sequence to go on where
+it stopped and silently drops the rest, so about half the unmutes never
+reached the peer (pion/webrtc#2623). `rtpstream.Wrap` sits between the track
+and the sender and shifts each bind to continue the previous one: sequence by
+one packet, timestamp by the time the mic was out. The speaker reads a
+timestamp jump with no missing packets after running dry as a new talk spurt,
+not as an underrun.
+
 **Rationale:** an open mic costs a few % of a core for the whole session;
 push-to-talk costs nothing while silent, and it is what gaming voice apps use.
 Keeping the keyboard out of the client keeps X11 out of the library and tests.
@@ -267,16 +281,123 @@ The key must include a modifier, and it is grabbed from the rest of the system
 while Ares runs. Desktops take common combinations (XFCE owns Ctrl+F1..F12),
 so the suggested default is `ctrl+shift+f9`.
 
+### D16 - Video: D1 stays, H.264 through the bundled openh264
+
+The D1 revisit for video came out in favour of staying with Go. Capture is
+mediadevices' camera driver (v4l2 in pure Go on Linux, DirectShow through cgo
+on Windows). Encoding is mediadevices' openh264. Decoding goes through a small
+cgo wrapper of our own (`h264/`) over the same static library, which already
+ships the decoder even though mediadevices only uses the encoder.
+
+**Rationale:** no new system dependency. Measured on this machine with the
+bundled library:
+- 640x480 at 1 Mbps: encode ~3.4 ms, decode ~0.7 ms per frame;
+- 1280x720 at 2.5 Mbps: encode ~9 ms, decode ~2 ms;
+- camera to encode to decode at 720p: ~37% of one core.
+`make windows` links the camera driver and both codec halves with no DLL
+beyond what Windows ships (ole32, oleaut32, quartz).
+
+mediadevices gives the encoder the frame rate it measures on the first frame,
+which is 0, and openh264 then ignores the bitrate target: the first call
+between Linux and Windows sent 4-8 Mbps instead of 1 and choked on its own
+queues (RTT up to 2.7 s, audio running dry). The client's encoder builder
+fills in the camera's 30 fps; a test holds the camera to about 1 Mbps.
+
+The alternatives were weaker. VP8/VP9 needs a system libvpx on both OSes, and
+the pure-Go `x/image/vp8` only decodes key frames. A webview reverses D1.
+FFmpeg is a far heavier dependency for no gain between two peers.
+
+**Accepted cost:**
+- The bundled openh264 is 2.1.1, whose decoder has CVE-2025-27091 (heap
+  overflow, fixed in 2.6.0). The fix is a build change only: a fork of
+  mediadevices with newer `.a` files through `replace`, plus the headers in
+  `h264/include/`. Revisit before calls with people outside the test circle.
+- No audio/video sync yet: audio waits in its jitter buffer, video is shown as
+  soon as it decodes.
+- Fixed bitrate until adaptive bitrate lands.
+
+### D17 - Camera on and off mid-call without renegotiation
+
+Both peers add a video transceiver before the first offer, in every call. The
+camera is opened only when turned on, so the device stays free otherwise.
+Turning it on or off is `ReplaceTrack` on the live sender, with the track
+wrapped by `rtpstream.Wrap` like the mic (D15). A `video` envelope over the
+DataChannel (D4) tells the other side, since RTP just stops and would leave
+the last frame frozen on screen.
+
+The first delivery shows received video in a small Ebitengine window, in a
+`viewer/` package used only by `cmd/ares`.
+
+**Rationale:** the frontend needs camera on/off at any point in the call.
+Tested with two pion peers: no `OnNegotiationNeeded`, signaling stays stable,
+nothing is sent while off, and the remote `OnTrack` fires ~50 ms after turning
+it on. Renegotiation (D6) is left for phase 3, where a second video track is
+new media. Ebitengine is the shortest path to drawing frames. It keeps the
+full UI toolkit (A1) open, and it stays out of the client library and tests.
+
+`SetCamera(true)` returns at once and starts the camera in the background.
+The Windows driver opens a camera held by another app without an error and
+then never delivers a frame. mediadevices reads the first frame while binding
+the track, inside pion, so such a camera froze the handshake or
+`ReplaceTrack`, and with them the chat. The client therefore holds a camera
+back until it delivers a picture (4 s), closes it otherwise, and opens it
+again every second until it works or is cancelled. A camera freed by the
+other app comes on by itself. `OnCameraStatus` reports sending, off, or
+waiting and why.
+
+**Accepted cost:** every call negotiates H.264, even voice-only ones; a
+camera that is off costs no bandwidth. A camera that stops delivering in the
+middle of a call (pulled out) still hangs `SetCamera(false)`: mediadevices'
+unbind waits for the encoder goroutine, stuck reading the camera, and closing
+the camera first races inside mediadevices. Fixing it needs a source wrapper
+that can hand the encoder a last frame on demand. On Linux, Ebitengine needs cgo and the
+X11/GL development headers.
+
+### D18 - Manual camera quality
+
+Each peer picks how much of its own camera it sends, at any time:
+
+| Level | Width | fps | Bitrate |
+|---|---|---|---|
+| high (default) | 640 | 30 | 1000 kbps |
+| medium | 480 | 24 | 500 kbps |
+| low | 320 | 15 | 250 kbps |
+| minimum | 160 | 10 | 100 kbps |
+
+The height follows the camera's aspect ratio, and a camera smaller than the
+level is never enlarged. `framing/` shapes the frames before the encoder:
+nearest-neighbour downscale from any YCbCr to 4:2:0, and frame dropping on a
+due time that moves one interval per frame, so 30 to 24 fps drops one frame
+in five. Changing the level rebinds the camera track, which builds a new
+encoder with the level's bitrate and frame rate, while the camera itself
+stays open.
+
+**Rationale:** the first real call showed a home connection and a slow
+machine struggling with video. The level is the one knob that eases the
+network and the CPU on both sides at once. mediadevices' `video.Scale` fixes
+its size at creation and goes through `At`/`Set` per pixel, which its own
+comments call ten times costlier for YCbCr; `video.Throttle` runs on a fixed
+ticker. A rebind is needed because openh264 takes bitrate and frame rate only
+when the encoder is created, and the frame rate sets each frame's share of
+the bits: told the wrong one, the low level sent half its target. It is
+cheap: no reopening the camera, no renegotiation, and the numbering stays
+continuous through `rtpstream`.
+
+**Accepted cost:** a level change freezes the picture for a moment. A level
+only lowers what the peer sends; asking the other side to lower its video,
+which is what helps a peer with a weak download, is open (A7).
+
 ---
 
 ## Open decisions
 
 | # | Decision | When to decide |
 |---|----------|----------------|
-| A1 | Interface: a graphical UI is planned (which toolkit is open). The terminal client mixes incoming messages into the line being typed | Before calls are shared beyond testing |
+| A1 | Interface: a graphical UI is planned (which toolkit is open). The terminal client mixes incoming messages into the line being typed. Video uses an Ebitengine window for now (D17) | Before calls are shared beyond testing |
 | A4 | Local message history (SQLite / file / none) | Late phase 1 |
 | A5 | Database and persistent identity (see D2) | After phase 1 |
 | A6 | Reconnection strategy (ICE Restart) | Once dropouts become annoying |
+| A7 | The other peer adapting too: manual camera quality only lowers what each peer sends, so someone on a weak connection can cut their upload but not their download, which is the other peer's camera. Asking the other side for a lower level needs a `video_quality` envelope over the DataChannel (D4) and a policy for applying it | Right after manual camera quality ships |
 
 ### Limitation inherent to the model
 
@@ -309,12 +430,24 @@ contradicts the project's premise.
 - ~~Adaptive jitter buffer and `/stats`~~ (done, D14).
 - Packet loss concealment once `pion/opus` releases `DecodePLC`.
 - Opus in-band FEC and DTX, if `/stats` shows frequent real loss.
-- Renegotiation over the DataChannel (D6), so a call can start after the
-  connection is up.
-- Decision point for revisiting D1 (capture and encoding in Go).
+- ~~Decision point for revisiting D1 (capture and encoding in Go)~~ (done:
+  D1 stays, D16).
+- ~~Camera video (D16, D17)~~ (done locally: `h264/` decoder, `video/` receive
+  stream, reserved video transceiver, `SetCamera` with the `video` envelope,
+  PLI, `viewer/` window in `cmd/ares`, video in `/stats`).
+- ~~Camera video between Linux and Windows~~ (through ngrok; the DirectShow
+  camera works).
+- Confirm on Windows that a camera busy in another app no longer hangs the
+  call and comes on by itself once freed (D17).
+- ~~Manual camera quality~~ (done, D18: `SetVideoQuality`, `-quality`,
+  `/quality`, keys 1-4 in the window).
+- Asking the other peer to lower its quality (A7).
+- After that: adaptive bitrate (TWCC/GCC plus the encoder's `SetBitRate`),
+  openh264 2.6 or later (D16), 720p, audio/video sync.
 
 ### Phase 3 - Screen sharing with audio
-- A second video track on the same PeerConnection.
+- A second video track on the same PeerConnection, which needs renegotiation
+  over the DataChannel (D6).
 - System audio on Linux through the PulseAudio/PipeWire monitor -
   historically the most tedious part.
 

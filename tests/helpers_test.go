@@ -48,10 +48,10 @@ func waitFor(t *testing.T, what string, cond func() bool) {
 	t.Fatalf("timed out waiting for %s", what)
 }
 
-func newClient(t *testing.T, signalURL, room string) *client.Client {
+func newClient(t *testing.T, signalURL, room string, opts ...client.Option) *client.Client {
 	t.Helper()
 
-	c, err := client.New(signalURL, room, "test-id", "Tester")
+	c, err := client.New(signalURL, room, "test-id", "Tester", opts...)
 	if err != nil {
 		t.Fatalf("connect to room %q: %v", room, err)
 	}
@@ -62,12 +62,12 @@ func newClient(t *testing.T, signalURL, room string) *client.Client {
 
 // connectedPair brings up two peers in the same room and waits for both to
 // reach connected.
-func connectedPair(t *testing.T, room string) (*client.Client, *client.Client) {
+func connectedPair(t *testing.T, room string, opts ...client.Option) (*client.Client, *client.Client) {
 	t.Helper()
 
 	signalURL := newSignalingServer(t, 0)
-	a := newClient(t, signalURL, room)
-	b := newClient(t, signalURL, room)
+	a := newClient(t, signalURL, room, opts...)
+	b := newClient(t, signalURL, room, opts...)
 
 	waitFor(t, "both peers to reach connected", func() bool {
 		return a.ConnectionState() == webrtc.PeerConnectionStateConnected &&

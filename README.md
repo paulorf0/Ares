@@ -20,11 +20,15 @@ Voice calls work: the microphone is cleaned up (noise suppression, automatic
 gain, echo cancellation), encoded with Opus and sent, and the other peer's
 audio is played. The mic can stay open or work as push-to-talk with a global
 key. A call between Linux and Windows through an ngrok tunnel has worked.
-Video and screen sharing have not started.
+
+Camera video works: H.264 in both directions, shown in a small window, and
+the camera can be turned on and off at any point in the call. A video call
+between Linux and Windows through ngrok has worked. Screen sharing has not
+started.
 
 Not there yet: room codes are typed by hand rather than generated, the interface
-is a bare terminal (a graphical one is planned), and connections across
-restrictive NATs are unproven.
+is a terminal plus a video window (a graphical one is planned), and connections
+across restrictive NATs are unproven.
 
 This is a learning project: the goal is to understand the WebRTC protocol from
 the ground up, which is why it uses pion directly rather than embedding a
@@ -34,9 +38,12 @@ browser.
 
 - Go 1.27
 - A C/C++ compiler (`gcc`/`g++` on Linux, MinGW-w64 on Windows). Audio capture,
-  Opus encoding and audio processing are C/C++ libraries built through cgo; no
-  audio library has to be installed on the system.
-- On Linux, the X11 headers (`libx11-dev`) for the push-to-talk key.
+  Opus and H.264 encoding, H.264 decoding and audio processing are C/C++
+  libraries built through cgo; no audio or video library has to be installed
+  on the system.
+- On Linux, the X11 headers (`libx11-dev`) for the push-to-talk key, and the
+  OpenGL/X11 headers for the video window:
+  `sudo apt install libgl1-mesa-dev libxcursor-dev libxi-dev libxinerama-dev libxrandr-dev libxxf86vm-dev`.
 
 ## Running it
 
@@ -76,6 +83,25 @@ The key needs a modifier (`ctrl`, `shift`, `alt`, `super`) plus a letter, digit,
 doesn't let apps grab global keys. Testing on one machine, use headphones, or
 the two clients will feed back into each other.
 
+For video, `-video` opens a window with the other peer's camera, and `/camera`
+(or the C key in the window) turns yours on and off at any time; `-camera`
+starts with it on. The camera is only open while on. If another app is
+using it, Ares says so and keeps trying: the camera comes on by itself once
+the other app lets go, and `/camera` again cancels. `/stats` reports the
+video too. Two clients on one machine can't share a camera: only one gets it.
+
+If the video stutters or the connection struggles, lower what you send with
+`-quality` or, during the call, `/quality` or the keys 1-4 in the window:
+`high` (640 wide, 30 fps, 1 Mbps, the default), `medium` (480, 24 fps,
+500 kbps), `low` (320, 15 fps, 250 kbps) or `minimum` (160, 10 fps,
+100 kbps). The Portuguese names `alta`, `media`, `baixa` and `minima` work
+too. This lowers your upload and the other side's download; it does not yet
+ask the other side to lower theirs.
+
+```bash
+go run ./cmd/ares -room ABC123 -id 1 -name Alice -audio -video -camera
+```
+
 To reach someone on another network, expose the signaling server with a tunnel
 and point both clients at it:
 
@@ -113,6 +139,10 @@ expects Microsoft's compiler; the `Makefile` explains each one.
   intercept it.
 - **No offline messages.** Both peers must be online at the same time. The app
   is session-based, like a phone call.
+- **Old H.264 decoder.** The bundled openh264 is 2.1.1, which has a known
+  decoder vulnerability (CVE-2025-27091). Only call people you trust until it
+  is updated.
+- **Video at a fixed bitrate** (about 1 Mbps) and not synced with the audio.
 
 ## Design
 

@@ -30,7 +30,15 @@ type RoleMessage struct {
 
 const (
 	TypeString = "string"
+	// TypeVideo is handled by the client itself and never reaches the
+	// message handler; its payload is a VideoPayload.
+	TypeVideo = "video"
 )
+
+// VideoPayload tells the other peer whether the camera is being sent.
+type VideoPayload struct {
+	On bool `json:"on"`
+}
 
 type Message struct {
 	Type    string          `json:"type"`

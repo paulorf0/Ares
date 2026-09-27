@@ -11,8 +11,10 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/paulorf0/Ares/framing"
 	"github.com/paulorf0/Ares/messages"
 	"github.com/paulorf0/Ares/microphone"
+	"github.com/paulorf0/Ares/rtpstream"
 	"github.com/paulorf0/Ares/speaker"
 	"github.com/paulorf0/Ares/voice"
 	"github.com/pion/interceptor"
@@ -73,13 +75,14 @@ type Client struct {
 	handlerMu sync.Mutex
 	onMessage func(msg []byte)
 
-	// Codecs offered in the SDP. Always set, so a peer without audio can still
-	// receive it.
-	codecAudio *mediadevices.CodecSelector
+	// Codecs offered in the SDP. Always set, so a peer without audio or a
+	// camera can still receive them.
+	codecs *mediadevices.CodecSelector
 
 	// Voice call, only with WithAudio.
 	audio       bool
 	audioTrack  *mediadevices.AudioTrack
+	audioOut    *rtpstream.Track // audioTrack as bound to the sender
 	audioSender *webrtc.RTPSender
 	processor   *voice.Processor
 
@@ -111,6 +114,8 @@ type Client struct {
 	closeOnce sync.Once
 
 	pendingICE []webrtc.ICECandidateInit
+
+	video videoState
 }
 
 // New joins the room and starts the handshake in the background.
@@ -132,7 +137,19 @@ func New(signalURL, roomID string, id string, name string, opts ...Option) (*Cli
 	if err != nil {
 		return nil, fmt.Errorf("opus params: %w", err)
 	}
-	c.codecAudio = mediadevices.NewCodecSelector(mediadevices.WithAudioEncoders(&opusParams))
+	quality := VideoQuality(c.video.quality.Load())
+	if !quality.valid() {
+		return nil, fmt.Errorf("client: unknown video quality %d", int(quality))
+	}
+	c.video.shaper = framing.New(quality.shape())
+	h264Params, err := videoParams(&c.video)
+	if err != nil {
+		return nil, fmt.Errorf("h264 params: %w", err)
+	}
+	c.codecs = mediadevices.NewCodecSelector(
+		mediadevices.WithAudioEncoders(&opusParams),
+		mediadevices.WithVideoEncoders(h264Params),
+	)
 
 	if err := c.connect(signalURL, roomID); err != nil {
 		return nil, err
@@ -150,6 +167,10 @@ func New(signalURL, roomID string, id string, name string, opts ...Option) (*Cli
 			c.Close()
 			return nil, err
 		}
+	}
+	if err := c.addVideoTransceiver(); err != nil {
+		c.Close()
+		return nil, err
 	}
 	go c.readPump()
 
@@ -199,7 +220,7 @@ func (c *Client) createPeer() error {
 	}
 
 	mediaEngine := &webrtc.MediaEngine{}
-	c.codecAudio.Populate(mediaEngine)
+	c.codecs.Populate(mediaEngine)
 
 	// A custom MediaEngine skips pion's defaults, so NACK and RTCP reports
 	// have to be registered by hand.
@@ -221,10 +242,12 @@ func (c *Client) createPeer() error {
 
 	conn.OnTrack(func(track *webrtc.TrackRemote, _ *webrtc.RTPReceiver) {
 		slog.Info("remote track", "kind", track.Kind().String(), "codec", track.Codec().MimeType)
-		if track.Kind() != webrtc.RTPCodecTypeAudio {
-			return
+		switch track.Kind() {
+		case webrtc.RTPCodecTypeAudio:
+			c.readRemoteAudio(track)
+		case webrtc.RTPCodecTypeVideo:
+			c.readRemoteVideo(track)
 		}
-		c.readRemoteAudio(track)
 	})
 
 	conn.OnICECandidate(func(candidate *webrtc.ICECandidate) {
@@ -247,6 +270,7 @@ func (c *Client) createPeer() error {
 		slog.Info("peer connection state changed", "state", state.String())
 		if state == webrtc.PeerConnectionStateClosed || state == webrtc.PeerConnectionStateFailed {
 			c.endCall()
+			c.setRemoteCamera(false)
 		}
 	})
 
@@ -257,9 +281,13 @@ func (c *Client) setupDataChannel(dc *webrtc.DataChannel) {
 	dc.OnOpen(func() {
 		slog.Info("data channel open", "label", dc.Label())
 		c.closeSignaling()
+		c.channelOpened()
 	})
 
 	dc.OnMessage(func(msg webrtc.DataChannelMessage) {
+		if c.handleControl(msg.Data) {
+			return
+		}
 		c.handlerMu.Lock()
 		handler := c.onMessage
 		c.handlerMu.Unlock()
@@ -484,8 +512,8 @@ func (c *Client) DataChannel() *webrtc.DataChannel {
 	return c.channel
 }
 
-// Close releases the signaling connection, the peer connection, the mic and
-// the speaker.
+// Close releases the signaling connection, the peer connection, the mic, the
+// camera and the speaker.
 func (c *Client) Close() error {
 	c.closeSignaling()
 
@@ -496,6 +524,7 @@ func (c *Client) Close() error {
 	if c.audioTrack != nil {
 		err = errors.Join(err, c.audioTrack.Close())
 	}
+	err = errors.Join(err, c.closeCamera())
 
 	c.playerMu.Lock()
 	c.stopped = true
@@ -559,7 +588,7 @@ func (c *Client) openMicrophone() error {
 			constraints.SampleSize = prop.IntExact(2)
 			constraints.IsFloat = prop.BoolExact(false)
 		},
-		Codec: c.codecAudio,
+		Codec: c.codecs,
 	})
 	if err != nil {
 		return fmt.Errorf("get user media: %w", err)
@@ -583,6 +612,7 @@ func (c *Client) openMicrophone() error {
 	audioTrack.Transform(processor.CaptureTransform())
 
 	c.audioTrack = audioTrack
+	c.audioOut = rtpstream.Wrap(audioTrack)
 	c.processor = processor
 	return nil
 }
@@ -595,7 +625,7 @@ func (c *Client) addAudioTrack() error {
 		return errors.New("add audio track: connRTC == nil")
 	}
 
-	sender, err := c.connRTC.AddTrack(c.audioTrack)
+	sender, err := c.connRTC.AddTrack(c.audioOut)
 	if err != nil {
 		return fmt.Errorf("add audio track: %w", err)
 	}
@@ -717,7 +747,7 @@ func (c *Client) applyVoice() error {
 
 	var track webrtc.TrackLocal
 	if want {
-		track = c.audioTrack
+		track = c.audioOut
 	}
 	if err := c.audioSender.ReplaceTrack(track); err != nil {
 		return fmt.Errorf("switch mic: %w", err)
@@ -762,11 +792,13 @@ type Stats struct {
 	// MicDropped counts mic chunks lost while sending; each is a gap the
 	// other peer hears.
 	MicDropped uint64
+	// Video describes the camera and the other peer's video.
+	Video VideoStats
 }
 
-// Stats reports the connection and the audio in both directions.
+// Stats reports the connection, and audio and video in both directions.
 func (c *Client) Stats() Stats {
-	stats := Stats{Audio: c.audio}
+	stats := Stats{Audio: c.audio, Video: c.videoStats()}
 	stats.RTT, _ = c.Ping()
 
 	c.playerMu.Lock()

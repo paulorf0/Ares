@@ -157,13 +157,17 @@ func (s *Stream) Push(pkt *rtp.Packet, arrival time.Time) {
 	s.track(pkt.Timestamp, arrival)
 }
 
-// isRestart spots the other peer starting over, as it does after each
-// push-to-talk pause: sequence and timestamp jump to new random values.
+// isRestart spots a new talk spurt: the numbers jump (a peer that restarts
+// its RTP stream), or, once playback has run dry, the timestamp moves further
+// than the missing packets explain, which is how a pause in sending shows up.
 func (s *Stream) isRestart(pkt *rtp.Packet) bool {
 	seqGap := int16(pkt.SequenceNumber - s.playSeq)
 	tsGap := int32(pkt.Timestamp - s.playTS)
-	return seqGap > restartGap || seqGap < -restartGap ||
-		tsGap > maxGapSamples || tsGap < -maxGapSamples
+	if seqGap > restartGap || seqGap < -restartGap ||
+		tsGap > maxGapSamples || tsGap < -maxGapSamples {
+		return true
+	}
+	return s.dry && seqGap >= 0 && tsGap > int32(seqGap+1)*int32(s.packetSamples)
 }
 
 // restart forgets the previous talk spurt. The target delay is kept: the

@@ -409,3 +409,24 @@ func TestSpeakerStatsSettleWhenAudioStops(t *testing.T) {
 		t.Errorf("stats kept moving with no audio:\nbefore %+v\nafter  %+v", settled, after)
 	}
 }
+
+func TestSpeakerResumesAfterShortPauseWithContinuousNumbers(t *testing.T) {
+	c := newCall(t)
+	first := toneFrames(append(c.send(tonePackets(t, 50, 1000, 0), onTime), c.drain()...))
+
+	// Half a second off: numbering goes on where it stopped, the timestamp
+	// moves by the time that passed.
+	pause := uint32(48000 / 2)
+	second := toneFrames(append(c.send(tonePackets(t, 50, 1050, 50*packetSamples+pause), onTime), c.drain()...))
+
+	if second < first-3 {
+		t.Errorf("after the pause only %d frames of tone played, before %d", second, first)
+	}
+	stats := c.stream.Stats()
+	if stats.Underruns != 0 {
+		t.Errorf("a short pause counted as %d underruns", stats.Underruns)
+	}
+	if stats.Lost != 0 {
+		t.Errorf("a short pause counted as %d lost packets", stats.Lost)
+	}
+}
