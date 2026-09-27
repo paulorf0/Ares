@@ -141,7 +141,7 @@ becomes annoying in practice.
 ### D11 - Repo layout: library packages plus thin commands
 
 ```
-client/       WebRTC peer: signaling handshake, data channel
+client/       WebRTC peer: facade over client/internal/ (D19)
 server/       signaling hub: rooms, roles, blind relay
 messages/     wire format shared by both
 microphone/   capture driver for mediadevices (D13)
@@ -386,6 +386,34 @@ continuous through `rtpstream`.
 **Accepted cost:** a level change freezes the picture for a moment. A level
 only lowers what the peer sends; asking the other side to lower its video,
 which is what helps a peer with a weak download, is open (A7).
+
+### D19 - `client` as a facade over internal parts
+
+`client.Client` only wires parts together; each part lives in its own package
+under `client/internal/`, with its own state and locks:
+
+```
+signaling/    websocket to the server: role, envelopes, close
+peer/         PeerConnection, offer/answer, buffered ICE, RTT
+channel/      data channel: stamped sends, control messages by type
+audio/        mic, voice mode, playback, audio stats
+camera/       camera sending, quality levels, start with retry
+remotevideo/  the other peer's video and camera state
+```
+
+The parts never import `client` nor each other. What one needs from another
+comes in as a function or a small interface: `peer` sends through a
+`Signaler`, `camera` announces its state through a `Notifier` (the channel),
+`remotevideo` asks for key frames through a `WriteRTCP` function. The data
+channel routes control messages by `type` (D4) to whoever registered it, and
+everything else to the user's handler. The public API did not change.
+
+**Rationale:** the single `Client` had reached ~1500 lines, ~40 fields and 8
+mutexes, with audio and video called from the handshake and data channel
+code. The roadmap grows exactly those seams: `video_quality` (A7) is one more
+control type, and renegotiation over the data channel (D6) is `peer` with a
+`Signaler` that writes to the channel instead of the websocket. `internal/`
+lets the compiler hold the boundaries without widening the public API.
 
 ---
 
